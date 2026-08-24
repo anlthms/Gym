@@ -6,11 +6,16 @@ from resources_servers.arc_agi_2.logic import (
     EpisodeState,
     PredictionParseError,
     TerminationReason,
+    TransformDescriptionParseError,
     assert_model_request_safe,
+    build_eval_feedback_prompt,
     build_executor_prompt,
+    build_nvarc_proposer_prompt,
     build_proposer_prompt,
+    build_single_executor_prompt,
     compare_grid,
     conservative_text_token_bound,
+    parse_canonical_rule,
     parse_tagged_grids,
     parse_transform_description,
     verify_predictions,
@@ -143,3 +148,98 @@ def test_prompts_separate_public_and_hidden_fields() -> None:
     assert "Test input test_0" in proposer
     assert "0 1" not in executor
     assert "train_0" in executor
+
+
+def test_parse_canonical_rule_rerenders_in_canonical_order() -> None:
+    text = (
+        "scratchpad thoughts\n"
+        "<puzzle_concepts>symmetry</puzzle_concepts>\n"
+        "<rules_summary>Mirror the grid.</rules_summary>\n"
+        "<solution_steps>1. Flip horizontally.</solution_steps>\n"
+        "<key_insight>The axis is vertical.</key_insight>"
+    )
+    rendered = parse_canonical_rule(text)
+    assert rendered == (
+        "<rules_summary>\nMirror the grid.\n</rules_summary>\n\n"
+        "<solution_steps>\n1. Flip horizontally.\n</solution_steps>\n\n"
+        "<key_insight>\nThe axis is vertical.\n</key_insight>\n\n"
+        "<puzzle_concepts>\nsymmetry\n</puzzle_concepts>"
+    )
+
+
+def test_parse_canonical_rule_takes_last_occurrence() -> None:
+    text = (
+        "<rules_summary>draft</rules_summary>"
+        "<solution_steps>s</solution_steps><key_insight>k</key_insight>"
+        "<puzzle_concepts>p</puzzle_concepts>"
+        "<rules_summary>final</rules_summary>"
+    )
+    assert "final" in parse_canonical_rule(text)
+    assert "draft" not in parse_canonical_rule(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        ("<rules_summary>only one section</rules_summary>", "solution_steps"),
+        (
+            "<rules_summary>r</rules_summary><solution_steps></solution_steps>"
+            "<key_insight>k</key_insight><puzzle_concepts>p</puzzle_concepts>",
+            "solution_steps",
+        ),
+        (
+            "<rules_summary>r</rules_summary><solution_steps>def f(x):</solution_steps>"
+            "<key_insight>k</key_insight><puzzle_concepts>p</puzzle_concepts>",
+            "Python",
+        ),
+    ],
+)
+def test_parse_canonical_rule_rejects_invalid(text: str, match: str) -> None:
+    with pytest.raises(TransformDescriptionParseError, match=match):
+        parse_canonical_rule(text)
+
+
+def test_single_executor_prompt_matches_the_training_contract() -> None:
+    prompt = build_single_executor_prompt(description="Reverse each row.", input_grid=[[1, 0]])
+    assert prompt.startswith("You are an exact grid-transformation executor.")
+    assert "<transformation>\nReverse each row.\n</transformation>" in prompt
+    assert "<input>\n1 0\n</input>" in prompt
+    assert prompt.endswith("Preserve the exact output shape implied by the operation.\n")
+    assert "JSON" in prompt  # the no-JSON instruction is part of the contract
+
+
+def test_nvarc_proposer_prompt_shows_demos_but_never_eval_grids() -> None:
+    prompt = build_nvarc_proposer_prompt(demo_pairs=[{"input": [[1, 0]], "output": [[0, 1]]}])
+    assert "demo_0" in prompt
+    assert "1 0" in prompt and "0 1" in prompt
+    assert "rules_summary" in prompt and "puzzle_concepts" in prompt
+    assert "Test input" not in prompt
+
+
+def test_eval_feedback_renders_all_behavioral_evidence() -> None:
+    feedback = build_eval_feedback_prompt(
+        grid_id="test_1",
+        input_grid=[[1, 0]],
+        predicted=[[1, 1]],
+        expected=[[0, 1]],
+        diff_feedback="Example test_1: mismatch",
+    )
+    assert "test_1" in feedback
+    assert "Input:\n1 0" in feedback
+    assert "Executor output:\n1 1" in feedback
+    assert "Expected output:\n0 1" in feedback
+    assert "mismatch" in feedback
+    assert "replacement rule" in feedback
+
+
+def test_eval_sequence_state_transitions() -> None:
+    state = EpisodeState.initial().description_generated()
+    state = state.eval_grid_solved(all_solved=False)
+    assert state.phase is EpisodePhase.EXECUTOR_TRAIN
+    failed = state.eval_grid_failed()
+    assert failed.phase is EpisodePhase.PROPOSER
+    assert failed.round_index == 1
+    done = state.eval_grid_solved(all_solved=True)
+    assert done.termination_reason is TerminationReason.ALL_SOLVED
+    reset = state.next_grid()
+    assert not reset.format_retry_used

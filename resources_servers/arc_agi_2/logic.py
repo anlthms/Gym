@@ -63,9 +63,10 @@ class EpisodePhase(str, Enum):
 
 
 class TerminationReason(str, Enum):
-    """Terminal outcomes emitted by the first implementation track."""
+    """Terminal outcomes across both episode protocols."""
 
     TRAIN_VERIFIED = "train_verified"
+    ALL_SOLVED = "all_solved"
     CONTEXT_EXHAUSTED = "context_exhausted"
     EXECUTOR_FORMAT_FAILURE = "executor_format_failure"
     EXECUTOR_CONTEXT_EXHAUSTED = "executor_context_exhausted"
@@ -152,15 +153,39 @@ class EpisodeState:
         return replace(self, phase=EpisodePhase.EXECUTOR_TRAIN, format_retry_used=False)
 
     def executor_format_failed(self) -> EpisodeState:
-        self._require_phase(EpisodePhase.EXECUTOR_TRAIN)
+        if self.phase not in (EpisodePhase.EXECUTOR_TRAIN, EpisodePhase.EXECUTOR_TEST):
+            raise RuntimeError(f"unexpected executor format failure in phase {self.phase.value}")
         if self.format_retry_used:
             return self.terminate(TerminationReason.EXECUTOR_FORMAT_FAILURE)
         return replace(self, format_retry_used=True)
+
+    def next_grid(self) -> EpisodeState:
+        """Advance to another grid in the same executor sweep, resetting the retry."""
+        if self.phase not in (EpisodePhase.EXECUTOR_TRAIN, EpisodePhase.EXECUTOR_TEST):
+            raise RuntimeError(f"cannot advance grids in phase {self.phase.value}")
+        return replace(self, format_retry_used=False)
 
     def training_verified(self, *, all_exact: bool) -> EpisodeState:
         self._require_phase(EpisodePhase.EXECUTOR_TRAIN)
         if all_exact:
             return replace(self, phase=EpisodePhase.EXECUTOR_TEST, format_retry_used=False)
+        return replace(
+            self,
+            phase=EpisodePhase.PROPOSER,
+            round_index=self.round_index + 1,
+            format_retry_used=False,
+        )
+
+    def eval_grid_solved(self, *, all_solved: bool) -> EpisodeState:
+        """Advance the evaluation-grid sequence after an exact solve."""
+        self._require_phase(EpisodePhase.EXECUTOR_TRAIN)
+        if all_solved:
+            return self.terminate(TerminationReason.ALL_SOLVED)
+        return replace(self, format_retry_used=False)
+
+    def eval_grid_failed(self) -> EpisodeState:
+        """Return to the proposer for a revision of the current rule."""
+        self._require_phase(EpisodePhase.EXECUTOR_TRAIN)
         return replace(
             self,
             phase=EpisodePhase.PROPOSER,
@@ -238,6 +263,40 @@ def parse_tagged_grids(text: str, *, tag: str, expected_ids: list[str]) -> dict[
         extra = sorted(actual_ids - required_ids)
         raise PredictionParseError(f"<{tag}> keys do not match; missing={missing}, extra={extra}")
     return {grid_id: validate_grid(payload[grid_id], grid_id=grid_id) for grid_id in expected_ids}
+
+
+# The canonical proposer<->executor rule schema, in render order. Matches the
+# NVARC ingestion schema used for executor training rows, so a co-trained
+# policy proposes rules in exactly the format it learned to execute.
+CANONICAL_SECTIONS = (
+    "rules_summary",
+    "solution_steps",
+    "key_insight",
+    "puzzle_concepts",
+)
+
+_CANONICAL_SECTION_RES = {name: re.compile(rf"<{name}>\s*(.*?)\s*</{name}>", re.DOTALL) for name in CANONICAL_SECTIONS}
+
+
+def parse_canonical_rule(text: str) -> str:
+    """Extract and re-render the proposer's canonical 4-section rule.
+
+    Every canonical section must be present and non-empty; when a tag repeats,
+    the last occurrence wins (the same final-answer convention the answer-grid
+    parser uses, so scratchpad text cannot displace the real rule). The
+    sections are re-rendered in canonical order, which is byte-identical to
+    the executor-training rule rendering.
+    """
+    sections: dict[str, str] = {}
+    for name in CANONICAL_SECTIONS:
+        matches = _CANONICAL_SECTION_RES[name].findall(text)
+        if not matches or not matches[-1].strip():
+            raise TransformDescriptionParseError(f"response must contain one non-empty <{name}> section")
+        sections[name] = matches[-1].strip()
+    rendered = "\n\n".join(f"<{name}>\n{sections[name]}\n</{name}>" for name in CANONICAL_SECTIONS)
+    if re.search(r"```\s*python|\bdef\s+\w+\s*\(", rendered, flags=re.IGNORECASE):
+        raise TransformDescriptionParseError("rule sections must not contain Python")
+    return rendered
 
 
 def parse_transform_description(text: str) -> str:
@@ -420,4 +479,107 @@ def build_format_retry_prompt(*, tag: str, expected_ids: list[str], error: str) 
         f"Your previous response could not be parsed: {error}\n"
         "Do not change or reinterpret the transformation. Reformat the same predictions as valid JSON with exactly "
         f"the keys {expected_ids}, inside one <{tag}>...</{tag}> block, and emit no other text."
+    )
+
+
+# The single-grid executor contract. This text must stay byte-identical to
+# NeMo-RL's examples/prompts/nvarc_executor.txt (rendered there with
+# task_data_spec.prompt.format(task_body), no system message), so a policy
+# trained on native executor rows sees exactly the same task through this
+# server. The trailing newline is part of the contract.
+NVARC_EXECUTOR_PROMPT_TEMPLATE = """You are an exact grid-transformation executor. Apply the supplied transformation
+mechanically to the input grid. Do not infer, alter, critique, or explain the
+transformation.
+
+Each grid is written one row per line with cells separated by single spaces.
+Cells are integer colors: 0=black, 1=blue, 2=red, 3=green, 4=yellow, 5=gray,
+6=fuchsia, 7=orange, 8=teal, 9=brown.
+
+{}
+
+Return exactly one answer block in this form:
+
+<answer>
+0 1 2
+3 4 5
+</answer>
+
+The block must contain only the transformed grid. Do not use JSON, prose, or a
+Markdown code fence. Preserve the exact output shape implied by the operation.
+"""
+
+
+def build_single_executor_prompt(*, description: str, input_grid: Grid) -> str:
+    """Render one rule plus one grid as the shared single-grid executor task."""
+    task_body = f"<transformation>\n{description}\n</transformation>\n<input>\n{format_grid(input_grid)}\n</input>"
+    return NVARC_EXECUTOR_PROMPT_TEMPLATE.format(task_body)
+
+
+def build_single_grid_format_retry_prompt() -> str:
+    """Request only a corrected rendering of the same single-grid answer.
+
+    Wording matches NeMo-RL's executor benchmark retry so the one format-only
+    retry is the same event in training, benchmarking, and episodes.
+    """
+    return (
+        "Your previous response did not contain a parseable grid inside an "
+        "<answer> block. Do not change or reinterpret the transformation. Return "
+        "exactly one grid using this form:\n\n"
+        "<answer>\n"
+        "0 1 2\n"
+        "3 4 5\n"
+        "</answer>\n\n"
+        "Do not include JSON, prose, or a Markdown code fence."
+    )
+
+
+def build_nvarc_proposer_prompt(*, demo_pairs: list[dict[str, Grid]]) -> str:
+    """Build the persistent proposer prompt for the evaluation-grid sequence.
+
+    Shows only the demonstration pairs -- the held-out evaluation inputs are
+    not revealed up front, so the rule must generalize rather than fit them.
+    """
+    sections = [
+        "Infer one general transformation rule from the paired ARC training examples.",
+        COLOR_MAPPING,
+    ]
+    for index, pair in enumerate(demo_pairs):
+        sections.append(
+            f"Training example demo_{index}\nInput:\n{format_grid(pair['input'])}\nOutput:\n{format_grid(pair['output'])}"
+        )
+    sections.append(
+        "First briefly describe the important objects, colors, shapes, symmetries, and spatial relationships; "
+        "compare inputs and outputs to identify invariants and changes; then infer a rule that an independent "
+        "executor can apply to a new input grid. Generalize beyond the displayed grids. Do not emit Python or a "
+        "predicted grid. Return the rule as exactly these four sections:\n"
+        "<rules_summary>\n...\n</rules_summary>\n"
+        "<solution_steps>\n...\n</solution_steps>\n"
+        "<key_insight>\n...\n</key_insight>\n"
+        "<puzzle_concepts>\n...\n</puzzle_concepts>"
+    )
+    return "\n\n".join(sections)
+
+
+def build_eval_feedback_prompt(
+    *,
+    grid_id: str,
+    input_grid: Grid,
+    predicted: Grid | None,
+    expected: Grid,
+    diff_feedback: str,
+) -> str:
+    """Render the behavioral evidence for one failed evaluation grid.
+
+    The proposer receives only the input, the executor's output, the expected
+    output, and the deterministic diff -- never executor reasoning.
+    """
+    predicted_text = format_grid(predicted) if predicted is not None else "(no parseable grid)"
+    return (
+        f"An independent executor applied your rule to a held-out grid {grid_id}. It failed.\n\n"
+        f"Input:\n{format_grid(input_grid)}\n\n"
+        f"Executor output:\n{predicted_text}\n\n"
+        f"Expected output:\n{format_grid(expected)}\n\n"
+        f"{diff_feedback}\n\n"
+        "Return a complete replacement rule, not a patch and not a grid. Return exactly the four sections "
+        "<rules_summary>, <solution_steps>, <key_insight>, and <puzzle_concepts>."
     )

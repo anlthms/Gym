@@ -37,14 +37,50 @@ from resources_servers.arc_agi_2.logic import (
     BatchVerification,
     Grid,
     PredictionParseError,
+    build_eval_feedback_prompt,
+    compare_grid,
     parse_tagged_grids,
     validate_grid,
     verify_predictions,
 )
+from resources_servers.arc_agi_2.scoring import (
+    RewardWeights,
+    extract_answer_grid,
+    reward_floor,
+    score_grid,
+)
 
 
 class ARCAGIResourcesServerConfig(BaseResourcesServerConfig):
-    """Configuration for the ARC-AGI resources server."""
+    """Configuration for the ARC-AGI resources server.
+
+    The reward weights mirror NeMo-RL's ``ArcAgiEnvConfig`` defaults: exact
+    match dominates the sum of all shaping terms, the similarity terms are
+    paid as gain over echoing the input, and ``extraneous_color_weight``
+    keeps ``color_weight`` from being maxed for free.
+    """
+
+    exact_weight: float = 1.0
+    cell_weight: float = 0.20
+    edit_weight: float = 0.10
+    color_weight: float = 0.05
+    extraneous_color_weight: float = 0.05
+    shape_weight: float = 0.05
+    format_weight: float = 0.05
+    # Added once to the aggregated evaluation-sequence reward when every
+    # held-out grid was solved exactly.
+    all_solved_bonus: float = 0.5
+
+    def reward_weights(self) -> RewardWeights:
+        return RewardWeights(
+            exact=self.exact_weight,
+            cell=self.cell_weight,
+            edit=self.edit_weight,
+            color=self.color_weight,
+            extraneous=self.extraneous_color_weight,
+            shape=self.shape_weight,
+            format=self.format_weight,
+        )
 
 
 class ARCGridPair(BaseModel):
@@ -103,8 +139,31 @@ class ARCAGIRunRequest(BaseRunRequest):
         return [ARCTestPair(input=self.test_input, output=self.expected_output)]
 
 
-class ARCAGIVerifyRequest(ARCAGIRunRequest, BaseVerifyRequest):
-    """Legacy direct-answer verification request."""
+class ARCAGIVerifyRequest(BaseVerifyRequest):
+    """Single-turn verification request.
+
+    Two row shapes are accepted: answer-contract rows carrying ``target`` and
+    ``test_input`` (single-grid executor tasks and real-ARC induction tasks,
+    scored with the shared ``<answer>`` parser and gain-over-echo reward), and
+    legacy induction rows carrying ``train``/``test`` grids (scored with the
+    boxed-array parser and exact-only reward).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    train: list[ARCGridPair] = Field(default_factory=list)
+    test: list[ARCTestPair] = Field(default_factory=list)
+    test_input: Grid | None = None
+    expected_output: Grid | None = None
+    target: Grid | None = None
+    task_id: str | None = None
+
+    def legacy_expected_output(self) -> Grid:
+        if self.test:
+            return self.test[0].output
+        if self.expected_output is None:
+            raise ValueError("legacy verification requires test pairs or expected_output")
+        return validate_grid(self.expected_output, grid_id="test_0 output")
 
 
 class ExecutorVerificationRequest(BaseModel):
@@ -112,6 +171,33 @@ class ExecutorVerificationRequest(BaseModel):
 
     response: NeMoGymResponse
     record_result: bool = True
+
+
+class EvalGridVerificationRequest(BaseModel):
+    """One fresh single-grid executor response for one evaluation grid."""
+
+    response: NeMoGymResponse
+    grid_id: str
+    record_result: bool = True
+
+
+class EvalGridVerificationResponse(BaseModel):
+    """Strict single-grid parse, comparison, and gain-over-echo score terms.
+
+    ``revision_feedback`` is the complete behavioral-evidence prompt (input,
+    executor output, expected output, diff) rendered server-side, so the
+    hidden target reaches the proposer only through this deliberate channel
+    and the agent never handles raw targets.
+    """
+
+    grid_id: str
+    format_valid: bool
+    parse_error: str | None = None
+    exact: bool = False
+    predicted: Grid | None = None
+    feedback: str
+    revision_feedback: str | None = None
+    terms: dict[str, float] = Field(default_factory=dict)
 
 
 class GridVerificationRecord(BaseModel):
@@ -145,22 +231,42 @@ class ARCAGIFinalizeRequest(BaseVerifyRequest):
 
     termination_reason: str
     loss_masked: bool
+    protocol: str = "hidden_test"
     trace: dict[str, Any]
 
 
 class ARCAGIVerifyResponse(BaseVerifyResponse):
-    """Episode result consumed by NeMo-RL and offline trace inspection."""
+    """Episode result consumed by NeMo-RL and offline trace inspection.
+
+    Scalar fields are deliberately top-level: NeMo-RL's gym rollout surfaces
+    them as per-agent metrics (``<agent_name>/<field>``), which is how
+    ``cell_match`` reaches validation and checkpoint selection.
+    """
 
     model_config = ConfigDict(extra="allow")
 
     task_id: str | None = None
     termination_reason: str | None = None
     loss_masked: bool = False
+    # NeMo-RL reads instance_config.mask_sample to zero the episode's loss
+    # multiplier (the sample still counts toward the group baseline).
+    instance_config: dict[str, Any] = Field(default_factory=lambda: {"mask_sample": False})
     train_gate_pass: bool = False
     test_exact: bool = False
     test_cell_accuracy: float = 0.0
     train_exact_fraction: float = 0.0
     train_cell_accuracy: float = 0.0
+    # Evaluation-sequence episode metrics (eval_sequence protocol only).
+    eval_exact_fraction: float = 0.0
+    eval_cell_match: float = 0.0
+    all_solved: bool = False
+    rounds_used: int = 0
+    # Single-turn answer-contract metrics (verify endpoint).
+    grid_match: float = 0.0
+    cell_match: float = 0.0
+    format_valid: float = 0.0
+    copied_input: float = 0.0
+    terms: dict[str, float] = Field(default_factory=dict)
     trace: dict[str, Any] = Field(default_factory=dict)
     expected_output: Grid | None = None
     predicted_output: Grid | None = None
@@ -178,6 +284,9 @@ class ARCSessionState:
     test_targets: dict[str, Grid]
     train_results: list[BatchVerification]
     test_result: BatchVerification | None
+    # Per-evaluation-grid attempt score terms, keyed by grid id
+    # (eval_sequence protocol).
+    eval_results: dict[str, list[dict[str, float]]]
 
 
 def _extract_assistant_text(response: NeMoGymResponse) -> str:
@@ -248,6 +357,7 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
         app = super().setup_webserver()
         app.post("/verify_training")(self.verify_training)
         app.post("/verify_test")(self.verify_test)
+        app.post("/verify_eval_grid")(self.verify_eval_grid)
         app.post("/finalize")(self.finalize)
         return app
 
@@ -262,6 +372,7 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             test_targets={f"test_{index}": pair.output for index, pair in enumerate(tests)},
             train_results=[],
             test_result=None,
+            eval_results={},
         )
         return BaseSeedSessionResponse()
 
@@ -301,6 +412,54 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             record_result=body.record_result,
         )
 
+    async def verify_eval_grid(
+        self,
+        request: Request,
+        body: EvalGridVerificationRequest,
+    ) -> EvalGridVerificationResponse:
+        """Verify one fresh single-grid ``<answer>`` response for one evaluation grid.
+
+        Scores with the shared gain-over-echo terms (the grid's own input is
+        the echo baseline) and records the attempt for finalize aggregation.
+        """
+        session = self._session(request)
+        if body.grid_id not in session.test_targets:
+            raise HTTPException(status_code=400, detail=f"unknown evaluation grid {body.grid_id!r}")
+        target = session.test_targets[body.grid_id]
+        echo_input = session.test_inputs[body.grid_id]
+        text = _extract_assistant_text(body.response)
+        predicted = extract_answer_grid(text)
+        terms = score_grid(predicted, target, echo_input, self.config.reward_weights())
+        if body.record_result:
+            session.eval_results.setdefault(body.grid_id, []).append(dict(terms))
+        if predicted is None:
+            return EvalGridVerificationResponse(
+                grid_id=body.grid_id,
+                format_valid=False,
+                parse_error="no parseable grid inside an <answer> block",
+                feedback="Executor format failure: no parseable grid inside an <answer> block",
+                terms=terms,
+            )
+        comparison = compare_grid(grid_id=body.grid_id, predicted=predicted, correct=target)
+        revision_feedback = None
+        if not comparison.exact:
+            revision_feedback = build_eval_feedback_prompt(
+                grid_id=body.grid_id,
+                input_grid=echo_input,
+                predicted=predicted,
+                expected=target,
+                diff_feedback=comparison.feedback,
+            )
+        return EvalGridVerificationResponse(
+            grid_id=body.grid_id,
+            format_valid=True,
+            exact=comparison.exact,
+            predicted=predicted,
+            feedback=comparison.feedback,
+            revision_feedback=revision_feedback,
+            terms=terms,
+        )
+
     def _verify_executor_response(
         self,
         response: NeMoGymResponse,
@@ -330,6 +489,8 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
 
     async def finalize(self, request: Request, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:
         session = self._session(request)
+        if body.protocol == "eval_sequence":
+            return self._finalize_eval_sequence(session, body)
         train_result = (
             max(
                 session.train_results,
@@ -342,16 +503,18 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
         train_gate_pass = any(result.all_exact for result in session.train_results)
         test_exact = bool(test_result and test_result.all_exact)
         return ARCAGIVerifyResponse(
-            **body.model_dump(exclude={"termination_reason", "loss_masked", "trace"}),
+            **body.model_dump(exclude={"termination_reason", "loss_masked", "protocol", "trace"}),
             reward=float(test_exact),
             task_id=session.task_id,
             termination_reason=body.termination_reason,
             loss_masked=body.loss_masked,
+            instance_config={"mask_sample": body.loss_masked},
             train_gate_pass=train_gate_pass,
             test_exact=test_exact,
             test_cell_accuracy=test_result.cell_accuracy if test_result else 0.0,
             train_exact_fraction=train_result.exact_fraction if train_result else 0.0,
             train_cell_accuracy=train_result.cell_accuracy if train_result else 0.0,
+            rounds_used=len(body.trace.get("rounds", [])),
             trace=body.trace,
             predicted_output=(
                 test_result.records[0].predicted if test_result and len(test_result.records) == 1 else None
@@ -362,18 +525,91 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             extraction_successful=test_result is not None,
         )
 
+    def _finalize_eval_sequence(self, session: ARCSessionState, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:
+        """Aggregate the evaluation-grid sequence into one episode reward.
+
+        Each grid contributes its best attempt's gain-over-echo grid score;
+        a grid the episode never reached sits at the reward floor, so ending
+        early is never better than attempting the remaining grids. A rule
+        that generalizes across several grids therefore outscores one that
+        happens to solve a single grid, and solving everything earns the
+        configured bonus on top.
+        """
+        floor = reward_floor(self.config.reward_weights())
+        per_grid_rewards: list[float] = []
+        per_grid_cell: list[float] = []
+        solved = 0
+        for grid_id in session.test_targets:
+            attempts = session.eval_results.get(grid_id, [])
+            if attempts:
+                per_grid_rewards.append(max(attempt["reward"] for attempt in attempts))
+                per_grid_cell.append(max(attempt["cell_match"] for attempt in attempts))
+                solved += int(any(attempt["grid_match"] for attempt in attempts))
+            else:
+                per_grid_rewards.append(floor)
+                per_grid_cell.append(0.0)
+        count = len(per_grid_rewards)
+        all_solved = count > 0 and solved == count
+        reward = sum(per_grid_rewards) / count if count else floor
+        if all_solved:
+            reward += self.config.all_solved_bonus
+        return ARCAGIVerifyResponse(
+            **body.model_dump(exclude={"termination_reason", "loss_masked", "protocol", "trace"}),
+            reward=reward,
+            task_id=session.task_id,
+            termination_reason=body.termination_reason,
+            loss_masked=body.loss_masked,
+            instance_config={"mask_sample": body.loss_masked},
+            eval_exact_fraction=solved / count if count else 0.0,
+            eval_cell_match=sum(per_grid_cell) / count if count else 0.0,
+            all_solved=all_solved,
+            rounds_used=len(body.trace.get("rounds", [])),
+            trace=body.trace,
+        )
+
     async def verify(self, body: ARCAGIVerifyRequest) -> ARCAGIVerifyResponse:
-        """Preserve the existing single-turn ARC verifier for legacy agents."""
+        """Verify one single-turn response.
+
+        Rows carrying ``target`` and ``test_input`` (executor tasks and
+        real-ARC induction tasks) are scored with the shared ``<answer>``
+        parser and gain-over-echo reward; ``grid_match``/``cell_match`` are
+        top-level so NeMo-RL surfaces them as per-agent validation metrics.
+        Rows without them fall back to the legacy boxed-array verifier.
+        """
         assistant_text = _extract_assistant_text(body.response)
+        if body.target is not None and body.test_input is not None:
+            try:
+                target = validate_grid(body.target, grid_id="target")
+                test_input = validate_grid(body.test_input, grid_id="test_input")
+            except PredictionParseError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+            predicted = extract_answer_grid(assistant_text)
+            terms = score_grid(predicted, target, test_input, self.config.reward_weights())
+            return ARCAGIVerifyResponse(
+                **body.model_dump(exclude={"task_id", "expected_output"}),
+                reward=terms["reward"],
+                task_id=body.task_id,
+                test_exact=bool(terms["grid_match"]),
+                grid_match=terms["grid_match"],
+                cell_match=terms["cell_match"],
+                format_valid=terms["format_valid"],
+                copied_input=terms["copied_input"],
+                terms=terms,
+                expected_output=target,
+                predicted_output=predicted,
+                extraction_successful=predicted is not None,
+            )
+
         predicted_grid = _parse_grid(assistant_text)
         extraction_successful = predicted_grid is not None
-        expected = body.normalized_tests()[0].output
+        expected = body.legacy_expected_output()
         exact = extraction_successful and predicted_grid == expected
         return ARCAGIVerifyResponse(
-            **body.model_dump(),
+            **body.model_dump(exclude={"task_id", "expected_output"}),
             reward=float(exact),
             task_id=body.task_id,
             test_exact=exact,
+            grid_match=float(exact),
             expected_output=expected,
             predicted_output=predicted_grid,
             extraction_successful=extraction_successful,

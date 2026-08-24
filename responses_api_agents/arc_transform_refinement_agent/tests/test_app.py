@@ -296,3 +296,177 @@ def test_config_rejects_invalid_context_reservation() -> None:
         assert "must fit" in str(error)
     else:
         raise AssertionError("invalid context reservation was accepted")
+
+
+CANONICAL_RULE = (
+    "<rules_summary>Reverse each row.</rules_summary>\n"
+    "<solution_steps>Reverse the cell order of every row.</solution_steps>\n"
+    "<key_insight>Only the horizontal order changes.</key_insight>\n"
+    "<puzzle_concepts>reversal</puzzle_concepts>"
+)
+
+
+class MockEvalAgent(ArcTransformRefinementAgent):
+    def set_model_responses(self, responses: list[NeMoGymResponse]) -> None:
+        object.__setattr__(self, "model_responses", list(responses))
+        object.__setattr__(self, "model_requests", [])
+
+    async def _call_model(self, *, request, server, params, cookies, run_body):
+        self.model_requests.append((server.name, params))
+        return self.model_responses.pop(0), {}
+
+    async def _call_resource(self, *, url_path, payload, cookies):
+        self.resource_requests.append((url_path, payload))
+        if url_path == "/verify_eval_grid":
+            return self.eval_results.pop(0), cookies
+        if url_path == "/finalize":
+            response = {
+                "responses_create_params": payload["responses_create_params"],
+                "response": payload["response"],
+                "reward": 0.0,
+                "termination_reason": payload["termination_reason"],
+                "loss_masked": payload["loss_masked"],
+                "protocol": payload["protocol"],
+                "trace": payload["trace"],
+            }
+            return response, cookies
+        raise AssertionError(f"unexpected resource path {url_path}")
+
+
+def _eval_agent(model_responses, eval_results) -> MockEvalAgent:
+    agent = MockEvalAgent(
+        config=_config(protocol="eval_sequence"),
+        server_client=MagicMock(spec=ServerClient),
+    )
+    agent.server_client.post = AsyncMock(return_value=_SeedResponse())
+    agent.set_model_responses(model_responses)
+    object.__setattr__(agent, "eval_results", list(eval_results))
+    object.__setattr__(agent, "resource_requests", [])
+    return agent
+
+
+def _eval_body() -> ArcTransformRunRequest:
+    return ArcTransformRunRequest(
+        responses_create_params={"input": [], "temperature": 0.0},
+        train=[{"input": [[1, 0]], "output": [[0, 1]]}],
+        test=[
+            {"input": [[2, 0]], "output": [[0, 2]]},
+            {"input": [[3, 0]], "output": [[0, 3]]},
+        ],
+        task_id="eval-task",
+    )
+
+
+async def test_eval_sequence_advances_on_solve_and_revises_on_fail() -> None:
+    evidence = "EVIDENCE test_1: expected differs"
+    agent = _eval_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n0 2\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response("<answer>\n3 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response(CANONICAL_RULE, prompt_tokens=160, generation_tokens=20),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [
+            {"grid_id": "test_0", "format_valid": True, "exact": True, "feedback": "exact", "revision_feedback": None},
+            {
+                "grid_id": "test_1",
+                "format_valid": True,
+                "exact": False,
+                "feedback": "mismatch",
+                "revision_feedback": evidence,
+            },
+            {"grid_id": "test_1", "format_valid": True, "exact": True, "feedback": "exact", "revision_feedback": None},
+        ],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _eval_body())
+
+    assert result.termination_reason == "all_solved"
+    assert not result.loss_masked
+    roles = [name for name, _ in agent.model_requests]
+    assert roles == ["proposer", "executor", "executor", "proposer", "executor"]
+
+    # Executor calls: fresh single-grid sessions, one user message, no
+    # instructions (byte-parity with native executor training rows).
+    for index in (1, 2, 4):
+        _, params = agent.model_requests[index]
+        assert "instructions" not in params
+        assert len(params["input"]) == 1
+        assert "<transformation>" in params["input"][0]["content"]
+        assert "Reverse each row." in params["input"][0]["content"]
+    # The rule is applied to exactly one grid per call.
+    assert "2 0" in agent.model_requests[1][1]["input"][0]["content"]
+    assert "3 0" not in agent.model_requests[1][1]["input"][0]["content"]
+
+    # The revision proposer turn carries the server-rendered evidence.
+    second_proposer_input = json.dumps(agent.model_requests[3][1]["input"])
+    assert evidence in second_proposer_input
+
+    # The solved grid's hidden target never appears in any model request.
+    all_model_requests = json.dumps([payload for _, payload in agent.model_requests])
+    assert "[[0, 2]]" not in all_model_requests
+    assert "0 2" not in json.dumps(agent.model_requests[0][1])  # not in the initial prompt
+
+    finalize_payload = agent.resource_requests[-1][1]
+    assert finalize_payload["protocol"] == "eval_sequence"
+    assert finalize_payload["response"]["output"][0]["content"][0]["text"] == CANONICAL_RULE
+
+
+async def test_eval_sequence_masks_double_executor_format_failure() -> None:
+    agent = _eval_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("no grid", prompt_tokens=60, generation_tokens=4),
+            _response("still no grid", prompt_tokens=70, generation_tokens=4),
+        ],
+        [
+            {
+                "grid_id": "test_0",
+                "format_valid": False,
+                "exact": False,
+                "feedback": "format",
+                "parse_error": "no grid",
+                "revision_feedback": None,
+            },
+            {
+                "grid_id": "test_0",
+                "format_valid": False,
+                "exact": False,
+                "feedback": "format",
+                "parse_error": "no grid",
+                "revision_feedback": None,
+            },
+        ],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _eval_body())
+
+    assert result.termination_reason == "executor_format_failure"
+    assert result.loss_masked
+    retry_input = agent.model_requests[2][1]["input"]
+    assert len(retry_input) == 3
+    assert "Do not change or reinterpret the transformation" in retry_input[-1]["content"]
+
+
+async def test_eval_sequence_masks_non_canonical_proposer_output() -> None:
+    agent = _eval_agent(
+        [
+            _response(
+                "<transform_description>not canonical</transform_description>", prompt_tokens=90, generation_tokens=8
+            )
+        ],
+        [],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _eval_body())
+
+    assert result.termination_reason == "agent_error"
+    assert result.loss_masked
+    assert len(agent.model_requests) == 1

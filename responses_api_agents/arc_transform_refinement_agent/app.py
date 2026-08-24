@@ -18,7 +18,7 @@ from __future__ import annotations
 import copy
 import time
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Request, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -46,10 +46,14 @@ from resources_servers.arc_agi_2.logic import (
     assert_model_request_safe,
     build_executor_prompt,
     build_format_retry_prompt,
+    build_nvarc_proposer_prompt,
     build_proposer_prompt,
     build_revision_prompt,
+    build_single_executor_prompt,
+    build_single_grid_format_retry_prompt,
     build_test_followup_prompt,
     conservative_text_token_bound,
+    parse_canonical_rule,
     parse_transform_description,
 )
 
@@ -70,6 +74,12 @@ class ArcTransformRefinementAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     proposer_model_server: ModelServerRef
     executor_model_server: ModelServerRef
+    # hidden_test: verify all training pairs, then answer the hidden test
+    # (the real-ARC protocol). eval_sequence: the NVARC co-training protocol
+    # -- demos shown, held-out evaluation grids solved one at a time with
+    # fresh single-grid executor sessions, advance-on-solve, revise-on-fail,
+    # reward aggregated server-side over the grid sequence.
+    protocol: Literal["hidden_test", "eval_sequence"] = "hidden_test"
     model_context_limit: int = 32_768
     reserved_proposer_output_tokens: int = 4_096
     chat_template_margin: int = 512
@@ -288,11 +298,16 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         *,
         input_items: list[dict[str, Any]],
         max_tokens: int,
-        instructions: str,
+        instructions: str | None,
     ) -> dict[str, Any]:
         params = body.responses_create_params.model_dump(exclude_none=True)
         params["input"] = copy.deepcopy(input_items)
-        params["instructions"] = instructions
+        # None omits the system message entirely: the single-grid executor
+        # contract is one user message, matching executor training rows.
+        if instructions is None:
+            params.pop("instructions", None)
+        else:
+            params["instructions"] = instructions
         params["max_output_tokens"] = max_tokens
         params["tools"] = []
         return params
@@ -342,6 +357,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             "response": last_proposer_response.model_dump(),
             "termination_reason": state.termination_reason.value,
             "loss_masked": loss_masked,
+            "protocol": self.config.protocol,
             "trace": {
                 "task_id": body.task_id,
                 "rounds": [asdict(round_trace) for round_trace in rounds],
@@ -359,6 +375,8 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
 
     async def run(self, request: Request, body: ArcTransformRunRequest) -> ArcTransformVerifyResponse:
         """Run refinement until the train gate passes or a terminal guard fires."""
+        if self.config.protocol == "eval_sequence":
+            return await self._run_eval_sequence(request, body)
         seed_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
             url_path="/seed_session",
@@ -611,6 +629,203 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             proposer_history.append(_message(feedback))
 
         raise RuntimeError("ARC episode terminated without returning a verifier response")
+
+    async def _run_single_eval_executor(
+        self,
+        *,
+        request: Request,
+        body: ArcTransformRunRequest,
+        description: str,
+        grid_id: str,
+        input_grid: Grid,
+        state: EpisodeState,
+        round_trace: RoundTrace,
+        resource_cookies: dict[str, str],
+    ) -> tuple[dict[str, Any] | None, EpisodeState, dict[str, str]]:
+        """Apply one rule to one evaluation grid in a fresh executor session.
+
+        One format-only retry; returns ``(verification, state, cookies)`` with
+        ``verification is None`` when a terminal guard fired (the returned
+        state is then TERMINATED and the episode must be loss-masked).
+        """
+        executor_history = [_message(build_single_executor_prompt(description=description, input_grid=input_grid))]
+        while True:
+            executor_params = self._params(
+                body,
+                input_items=executor_history,
+                max_tokens=self.config.executor_max_output_tokens,
+                instructions=None,
+            )
+            try:
+                executor_response, _, executor_call = await self._recorded_model_call(
+                    request=request,
+                    role="executor_eval",
+                    server=self.config.executor_model_server,
+                    params=executor_params,
+                    cookies=None,
+                    run_body=body,
+                )
+            except Exception as error:
+                if not _is_context_window_error(error):
+                    raise
+                return None, state.terminate(TerminationReason.EXECUTOR_CONTEXT_EXHAUSTED), resource_cookies
+            round_trace.executor_calls.append(executor_call)
+            verification, resource_cookies = await self._call_resource(
+                url_path="/verify_eval_grid",
+                payload={"response": executor_response.model_dump(), "grid_id": grid_id},
+                cookies=resource_cookies,
+            )
+            round_trace.training_verifications.append(verification)
+            if verification["format_valid"]:
+                return verification, state, resource_cookies
+            state = state.executor_format_failed()
+            if state.phase is EpisodePhase.TERMINATED:
+                return None, state, resource_cookies
+            executor_history.extend(item.model_dump() for item in executor_response.output)
+            executor_history.append(_message(build_single_grid_format_retry_prompt()))
+
+    async def _run_eval_sequence(self, request: Request, body: ArcTransformRunRequest) -> ArcTransformVerifyResponse:
+        """Run the NVARC evaluation-grid sequence: advance-on-solve, revise-on-fail.
+
+        The proposer sees only the demonstration pairs and induces a canonical
+        4-section rule; fresh single-grid executor sessions apply it to the
+        held-out evaluation grids in order. An exact solve advances to the
+        next grid with the same rule; a miss returns the server-rendered
+        behavioral evidence (input, prediction, expected, diff) for a
+        revision. Reward is aggregated server-side over the grid sequence.
+        """
+        seed_response = await self.server_client.post(
+            server_name=self.config.resources_server.name,
+            url_path="/seed_session",
+            json=body.model_dump(),
+            cookies=request.cookies,
+        )
+        await raise_for_status(seed_response)
+        resource_cookies = dict(seed_response.cookies)
+
+        eval_inputs = body.public_test_inputs()
+        eval_ids = list(eval_inputs)
+        proposer_history: list[dict[str, Any]] = [
+            _message(build_nvarc_proposer_prompt(demo_pairs=body.public_train_pairs()))
+        ]
+        budget = ContextBudget(
+            model_context_limit=self.config.model_context_limit,
+            reserved_proposer_output_tokens=self.config.reserved_proposer_output_tokens,
+            chat_template_margin=self.config.chat_template_margin,
+        )
+        state = EpisodeState.initial()
+        rounds: list[RoundTrace] = []
+        grid_index = 0
+
+        while True:
+            proposer_params = self._params(
+                body,
+                input_items=proposer_history,
+                max_tokens=self.config.proposer_max_output_tokens,
+                instructions=PROPOSER_INSTRUCTIONS,
+            )
+            proposer_response, _, proposer_call = await self._recorded_model_call(
+                request=request,
+                role="proposer",
+                server=self.config.proposer_model_server,
+                params=proposer_params,
+                cookies=None,
+                run_body=body,
+            )
+            round_trace = RoundTrace(
+                round_index=state.round_index,
+                proposer=proposer_call,
+                transform_description=None,
+                executor_calls=[],
+                training_verifications=[],
+                test_verification=None,
+                feedback=None,
+            )
+            rounds.append(round_trace)
+
+            try:
+                description = parse_canonical_rule(_response_text(proposer_response))
+            except TransformDescriptionParseError:
+                state = state.terminate(TerminationReason.AGENT_ERROR)
+                return await self._finalize(
+                    body=body,
+                    cookies=resource_cookies,
+                    last_proposer_response=proposer_response,
+                    state=state,
+                    rounds=rounds,
+                    loss_masked=True,
+                )
+            round_trace.transform_description = description
+            state = state.description_generated()
+
+            failed_verification: dict[str, Any] | None = None
+            while grid_index < len(eval_ids):
+                grid_id = eval_ids[grid_index]
+                verification, state, resource_cookies = await self._run_single_eval_executor(
+                    request=request,
+                    body=body,
+                    description=description,
+                    grid_id=grid_id,
+                    input_grid=eval_inputs[grid_id],
+                    state=state,
+                    round_trace=round_trace,
+                    resource_cookies=resource_cookies,
+                )
+                if verification is None:
+                    return await self._finalize(
+                        body=body,
+                        cookies=resource_cookies,
+                        last_proposer_response=proposer_response,
+                        state=state,
+                        rounds=rounds,
+                        loss_masked=True,
+                    )
+                if verification["exact"]:
+                    grid_index += 1
+                    state = state.eval_grid_solved(all_solved=grid_index == len(eval_ids))
+                    if state.phase is EpisodePhase.TERMINATED:
+                        return await self._finalize(
+                            body=body,
+                            cookies=resource_cookies,
+                            last_proposer_response=proposer_response,
+                            state=state,
+                            rounds=rounds,
+                            loss_masked=False,
+                        )
+                    continue
+                failed_verification = verification
+                break
+
+            assert failed_verification is not None  # a revision follows only a miss
+            state = state.eval_grid_failed()
+            feedback = failed_verification["revision_feedback"]
+            round_trace.feedback = feedback
+            current_tokens = proposer_call.prompt_tokens + proposer_call.output_tokens
+            if not budget.permits_revision(
+                current_proposer_tokens=current_tokens,
+                next_feedback_tokens=conservative_text_token_bound(feedback),
+            ):
+                state = state.terminate(TerminationReason.CONTEXT_EXHAUSTED)
+                return await self._finalize(
+                    body=body,
+                    cookies=resource_cookies,
+                    last_proposer_response=proposer_response,
+                    state=state,
+                    rounds=rounds,
+                    loss_masked=False,
+                )
+            if state.round_index >= self.config.max_rounds:
+                state = state.terminate(TerminationReason.EMERGENCY_ROUND_CAP)
+                return await self._finalize(
+                    body=body,
+                    cookies=resource_cookies,
+                    last_proposer_response=proposer_response,
+                    state=state,
+                    rounds=rounds,
+                    loss_masked=False,
+                )
+            proposer_history.extend(item.model_dump() for item in proposer_response.output)
+            proposer_history.append(_message(feedback))
 
 
 if __name__ == "__main__":

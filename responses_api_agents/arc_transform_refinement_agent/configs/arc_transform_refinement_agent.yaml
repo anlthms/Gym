@@ -11,6 +11,10 @@ arc_transform_refinement_agent:
       executor_model_server:
         type: responses_api_models
         name: policy_model
+      # hidden_test (real-ARC: verify training pairs, then answer the hidden
+      # test) or eval_sequence (NVARC co-training: held-out grids solved one
+      # at a time, advance-on-solve, revise-on-fail).
+      protocol: hidden_test
       model_context_limit: 32768
       reserved_proposer_output_tokens: 4096
       chat_template_margin: 512

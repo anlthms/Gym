@@ -6,6 +6,31 @@ arc_agi_2_resources_server:
       verified: false
       description: Verifier-guided ARC-AGI-2 episodes with hidden targets and predicted-vs-correct diff feedback. See https://arcprize.org/arc-agi.
       value: Improve puzzle-solving capabilities.
+      # Gain-over-echo reward weights (exact match dominates all shaping);
+      # mirror NeMo-RL's ArcAgiEnvConfig defaults.
+      exact_weight: 1.0
+      cell_weight: 0.20
+      edit_weight: 0.10
+      color_weight: 0.05
+      extraneous_color_weight: 0.05
+      shape_weight: 0.05
+      format_weight: 0.05
+      # Added once to the aggregated eval-sequence reward when every held-out
+      # grid was solved exactly.
+      all_solved_bonus: 0.5
+# Single-turn rows (executor tasks and real-ARC induction validation): one
+# model call, then the arc_agi_2 /verify endpoint scores the <answer> grid
+# with the gain-over-echo reward and top-level grid/cell metrics.
+arc_agi_2_simple_agent:
+  responses_api_agents:
+    simple_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: arc_agi_2_resources_server
+      model_server:
+        type: responses_api_models
+        name: policy_model
 arc_transform_refinement_agent:
   responses_api_agents:
     arc_transform_refinement_agent:
@@ -19,6 +44,10 @@ arc_transform_refinement_agent:
       executor_model_server:
         type: responses_api_models
         name: policy_model
+      # hidden_test (real-ARC: verify training pairs, then answer the hidden
+      # test) or eval_sequence (NVARC co-training: held-out grids solved one
+      # at a time, advance-on-solve, revise-on-fail).
+      protocol: hidden_test
       model_context_limit: 32768
       reserved_proposer_output_tokens: 4096
       chat_template_margin: 512

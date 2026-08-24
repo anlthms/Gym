@@ -110,16 +110,30 @@ class ARCTestPair(BaseModel):
 
 
 class ARCAGIRunRequest(BaseRunRequest):
-    """A seeded ARC task, supporting legacy one-test and new multi-test rows."""
+    """A seeded ARC task: episode rows, legacy one-test rows, or single-turn rows.
+
+    Single-turn answer-contract rows (executor tasks and real-ARC induction
+    tasks) carry ``target`` and ``test_input`` and no training pairs; the
+    session they seed holds the one hidden pair and ``verify`` reads the row
+    directly.
+    """
 
     train: list[ARCGridPair] = Field(default_factory=list)
     test: list[ARCTestPair] = Field(default_factory=list)
     test_input: Grid | None = None
     expected_output: Grid | None = None
+    target: Grid | None = None
     task_id: str | None = None
+
+    def is_single_turn(self) -> bool:
+        return not self.train and self.target is not None and self.test_input is not None
 
     @model_validator(mode="after")
     def validate_task(self) -> ARCAGIRunRequest:
+        if self.is_single_turn():
+            self.test_input = validate_grid(self.test_input, grid_id="test_0 input")
+            self.target = validate_grid(self.target, grid_id="test_0 target")
+            return self
         if not self.train:
             raise ValueError("ARC task must contain at least one training pair")
         if self.test:
@@ -135,7 +149,11 @@ class ARCAGIRunRequest(BaseRunRequest):
     def normalized_tests(self) -> list[ARCTestPair]:
         if self.test:
             return self.test
-        assert self.test_input is not None and self.expected_output is not None
+        assert self.test_input is not None
+        if self.is_single_turn():
+            assert self.target is not None
+            return [ARCTestPair(input=self.test_input, output=self.target)]
+        assert self.expected_output is not None
         return [ARCTestPair(input=self.test_input, output=self.expected_output)]
 
 

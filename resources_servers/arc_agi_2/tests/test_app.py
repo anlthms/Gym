@@ -345,3 +345,29 @@ class TestSingleTurnVerify:
         )
         assert result.test_exact
         assert result.reward == 1.0
+
+
+class TestSingleTurnSeeding:
+    async def test_seed_session_accepts_single_turn_rows(self) -> None:
+        """Executor and induction rows carry target/test_input and no train pairs."""
+        server = _server()
+        request = _request("single-turn")
+        await server.seed_session(
+            request,
+            ARCAGIRunRequest(
+                responses_create_params={"input": []},
+                target=[[0, 1]],
+                test_input=[[1, 0]],
+                task_id="executor-row",
+            ),
+        )
+        session = server._sessions["single-turn"]
+        assert session.train_targets == {}
+        assert session.test_targets == {"test_0": [[0, 1]]}
+
+    def test_episode_rows_still_require_training_pairs(self) -> None:
+        with pytest.raises(ValueError, match="at least one training pair"):
+            ARCAGIRunRequest(
+                responses_create_params={"input": []},
+                test=[{"input": [[1]], "output": [[2]]}],
+            )

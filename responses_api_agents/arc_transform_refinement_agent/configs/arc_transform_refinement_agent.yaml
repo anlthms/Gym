@@ -1,0 +1,21 @@
+arc_transform_refinement_agent:
+  responses_api_agents:
+    arc_transform_refinement_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: arc_agi_2_resources_server
+      proposer_model_server:
+        type: responses_api_models
+        name: policy_model
+      executor_model_server:
+        type: responses_api_models
+        name: policy_model
+      model_context_limit: 32768
+      reserved_proposer_output_tokens: 4096
+      chat_template_margin: 512
+      proposer_max_output_tokens: 4096
+      executor_max_output_tokens: 4096
+      max_rounds: 32
+      confirm_mismatches: false
+

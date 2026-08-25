@@ -25,7 +25,6 @@ arc_transform_refinement_agent:
       proposer_max_output_tokens: 4096
       executor_max_output_tokens: 4096
       max_rounds: 32
-      confirm_mismatches: false
       datasets:
       - name: training_1
         type: validation

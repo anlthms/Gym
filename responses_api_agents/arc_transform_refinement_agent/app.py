@@ -44,17 +44,11 @@ from resources_servers.arc_agi_2.logic import (
     TerminationReason,
     TransformDescriptionParseError,
     assert_model_request_safe,
-    build_executor_prompt,
-    build_format_retry_prompt,
     build_nvarc_proposer_prompt,
-    build_proposer_prompt,
-    build_revision_prompt,
     build_single_executor_prompt,
     build_single_grid_format_retry_prompt,
-    build_test_followup_prompt,
     conservative_text_token_bound,
     parse_canonical_rule,
-    parse_transform_description,
 )
 
 
@@ -74,11 +68,17 @@ class ArcTransformRefinementAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     proposer_model_server: ModelServerRef
     executor_model_server: ModelServerRef
-    # hidden_test: verify all training pairs, then answer the hidden test
-    # (the real-ARC protocol). eval_sequence: the NVARC co-training protocol
-    # -- demos shown, held-out evaluation grids solved one at a time with
-    # fresh single-grid executor sessions, advance-on-solve, revise-on-fail,
-    # reward aggregated server-side over the grid sequence.
+    # Both protocols share the same single-grid <answer> executor contract
+    # (byte-parity with native executor training rows) and the same canonical
+    # 4-section proposer rule.
+    # hidden_test: the real-ARC protocol -- refine the rule against the
+    # puzzle's own demo pairs (their outputs are public at inference), then
+    # answer every hidden test grid once with the current rule.
+    # eval_sequence: the NVARC co-training protocol -- demos shown, held-out
+    # evaluation grids solved one at a time, advance-on-solve,
+    # revise-on-fail, reward aggregated server-side over the grid sequence.
+    # A task row may override this default per episode via its own
+    # ``protocol`` field.
     protocol: Literal["hidden_test", "eval_sequence"] = "hidden_test"
     model_context_limit: int = 32_768
     reserved_proposer_output_tokens: int = 4_096
@@ -86,7 +86,6 @@ class ArcTransformRefinementAgentConfig(BaseResponsesAPIAgentConfig):
     proposer_max_output_tokens: int = 4_096
     executor_max_output_tokens: int = 4_096
     max_rounds: int = 32
-    confirm_mismatches: bool = False
 
     @model_validator(mode="after")
     def validate_limits(self) -> ArcTransformRefinementAgentConfig:
@@ -126,6 +125,9 @@ class ArcTransformRunRequest(BaseRunRequest):
     test_input: Grid | None = None
     expected_output: Grid | None = None
     task_id: str | None = None
+    # Per-row protocol override, so one agent instance can train on
+    # eval_sequence episodes and validate on hidden_test episodes.
+    protocol: Literal["hidden_test", "eval_sequence"] | None = None
 
     @model_validator(mode="after")
     def validate_task(self) -> ArcTransformRunRequest:
@@ -350,6 +352,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         state: EpisodeState,
         rounds: list[RoundTrace],
         loss_masked: bool,
+        protocol: str,
     ) -> ArcTransformVerifyResponse:
         assert state.termination_reason is not None
         payload = {
@@ -357,7 +360,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             "response": last_proposer_response.model_dump(),
             "termination_reason": state.termination_reason.value,
             "loss_masked": loss_masked,
-            "protocol": self.config.protocol,
+            "protocol": protocol,
             "trace": {
                 "task_id": body.task_id,
                 "rounds": [asdict(round_trace) for round_trace in rounds],
@@ -374,9 +377,23 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         return ArcTransformVerifyResponse.model_validate(result)
 
     async def run(self, request: Request, body: ArcTransformRunRequest) -> ArcTransformVerifyResponse:
-        """Run refinement until the train gate passes or a terminal guard fires."""
-        if self.config.protocol == "eval_sequence":
+        """Run one episode under the row's protocol (falling back to config)."""
+        protocol = body.protocol or self.config.protocol
+        if protocol == "eval_sequence":
             return await self._run_eval_sequence(request, body)
+        return await self._run_hidden_test(request, body)
+
+    async def _run_hidden_test(self, request: Request, body: ArcTransformRunRequest) -> ArcTransformVerifyResponse:
+        """Run the real-ARC protocol: demo-refinement loop, then the hidden test.
+
+        The proposer sees the demonstration pairs and induces a canonical
+        4-section rule; fresh single-grid executor sessions apply it to the
+        demo inputs in order and the server verifies against the (public)
+        demo outputs, returning behavioral evidence for a revision on a miss.
+        Whatever ends the loop -- all demos verified, context budget, or the
+        round cap -- the current rule is applied once to every hidden test
+        grid, and the server scores those final answers.
+        """
         seed_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
             url_path="/seed_session",
@@ -386,15 +403,11 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         await raise_for_status(seed_response)
         resource_cookies = dict(seed_response.cookies)
 
+        demo_inputs = {f"train_{index}": pair.input for index, pair in enumerate(body.train)}
+        demo_ids = list(demo_inputs)
         test_inputs = body.public_test_inputs()
-        train_inputs = {f"train_{index}": pair.input for index, pair in enumerate(body.train)}
         proposer_history: list[dict[str, Any]] = [
-            _message(
-                build_proposer_prompt(
-                    train_pairs=body.public_train_pairs(),
-                    test_inputs=list(test_inputs.values()),
-                )
-            )
+            _message(build_nvarc_proposer_prompt(demo_pairs=body.public_train_pairs()))
         ]
         budget = ContextBudget(
             model_context_limit=self.config.model_context_limit,
@@ -403,9 +416,13 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         )
         state = EpisodeState.initial()
         rounds: list[RoundTrace] = []
+        demo_index = 0
+        description: str | None = None
         last_proposer_response: NeMoGymResponse | None = None
+        loop_end: TerminationReason | None = None
+        loss_masked = False
 
-        while state.phase is not EpisodePhase.TERMINATED:
+        while loop_end is None:
             proposer_params = self._params(
                 body,
                 input_items=proposer_history,
@@ -433,9 +450,95 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             rounds.append(round_trace)
 
             try:
-                description = parse_transform_description(_response_text(proposer_response))
+                description = parse_canonical_rule(_response_text(proposer_response))
             except TransformDescriptionParseError:
-                state = state.terminate(TerminationReason.AGENT_ERROR)
+                loss_masked = True
+                if description is None:
+                    state = state.terminate(TerminationReason.AGENT_ERROR)
+                    return await self._finalize(
+                        body=body,
+                        cookies=resource_cookies,
+                        last_proposer_response=last_proposer_response,
+                        state=state,
+                        rounds=rounds,
+                        loss_masked=True,
+                        protocol="hidden_test",
+                    )
+                # A prior valid rule exists: still answer the hidden test.
+                loop_end = TerminationReason.AGENT_ERROR
+                state = state.demo_loop_exhausted()
+                break
+            round_trace.transform_description = description
+            state = state.description_generated()
+
+            failed_verification: dict[str, Any] | None = None
+            while demo_index < len(demo_ids):
+                grid_id = demo_ids[demo_index]
+                verification, state, resource_cookies = await self._run_single_eval_executor(
+                    request=request,
+                    body=body,
+                    description=description,
+                    grid_id=grid_id,
+                    input_grid=demo_inputs[grid_id],
+                    state=state,
+                    round_trace=round_trace,
+                    resource_cookies=resource_cookies,
+                )
+                if verification is None:
+                    return await self._finalize(
+                        body=body,
+                        cookies=resource_cookies,
+                        last_proposer_response=last_proposer_response,
+                        state=state,
+                        rounds=rounds,
+                        loss_masked=True,
+                        protocol="hidden_test",
+                    )
+                if verification["exact"]:
+                    demo_index += 1
+                    if demo_index == len(demo_ids):
+                        loop_end = TerminationReason.TRAIN_VERIFIED
+                        state = state.demos_verified()
+                        break
+                    state = state.eval_grid_solved(all_solved=False)
+                    continue
+                failed_verification = verification
+                break
+            if loop_end is not None:
+                break
+
+            assert failed_verification is not None  # a revision follows only a miss
+            state = state.eval_grid_failed()
+            feedback = failed_verification["revision_feedback"]
+            round_trace.feedback = feedback
+            current_tokens = proposer_call.prompt_tokens + proposer_call.output_tokens
+            if not budget.permits_revision(
+                current_proposer_tokens=current_tokens,
+                next_feedback_tokens=conservative_text_token_bound(feedback),
+            ):
+                loop_end = TerminationReason.CONTEXT_EXHAUSTED
+                state = state.demo_loop_exhausted()
+                break
+            if state.round_index >= self.config.max_rounds:
+                loop_end = TerminationReason.EMERGENCY_ROUND_CAP
+                state = state.demo_loop_exhausted()
+                break
+            proposer_history.extend(item.model_dump() for item in proposer_response.output)
+            proposer_history.append(_message(feedback))
+
+        assert description is not None and last_proposer_response is not None
+        for grid_id, input_grid in test_inputs.items():
+            verification, state, resource_cookies = await self._run_single_eval_executor(
+                request=request,
+                body=body,
+                description=description,
+                grid_id=grid_id,
+                input_grid=input_grid,
+                state=state,
+                round_trace=rounds[-1],
+                resource_cookies=resource_cookies,
+            )
+            if verification is None:
                 return await self._finalize(
                     body=body,
                     cookies=resource_cookies,
@@ -443,192 +546,18 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                     state=state,
                     rounds=rounds,
                     loss_masked=True,
+                    protocol="hidden_test",
                 )
-            round_trace.transform_description = description
-            state = state.description_generated()
-
-            executor_history = [
-                _message(
-                    build_executor_prompt(
-                        description=description,
-                        inputs=train_inputs,
-                        tag="predictions",
-                    )
-                )
-            ]
-            while True:
-                executor_params = self._params(
-                    body,
-                    input_items=executor_history,
-                    max_tokens=self.config.executor_max_output_tokens,
-                    instructions=EXECUTOR_INSTRUCTIONS,
-                )
-                try:
-                    executor_response, _, executor_call = await self._recorded_model_call(
-                        request=request,
-                        role="executor_train",
-                        server=self.config.executor_model_server,
-                        params=executor_params,
-                        cookies=None,
-                        run_body=body,
-                    )
-                except Exception as error:
-                    if not _is_context_window_error(error):
-                        raise
-                    state = state.terminate(TerminationReason.EXECUTOR_CONTEXT_EXHAUSTED)
-                    return await self._finalize(
-                        body=body,
-                        cookies=resource_cookies,
-                        last_proposer_response=last_proposer_response,
-                        state=state,
-                        rounds=rounds,
-                        loss_masked=True,
-                    )
-                round_trace.executor_calls.append(executor_call)
-                training_result, resource_cookies = await self._call_resource(
-                    url_path="/verify_training",
-                    payload={"response": executor_response.model_dump()},
-                    cookies=resource_cookies,
-                )
-                round_trace.training_verifications.append(training_result)
-                if training_result["format_valid"]:
-                    break
-                state = state.executor_format_failed()
-                if state.phase is EpisodePhase.TERMINATED:
-                    return await self._finalize(
-                        body=body,
-                        cookies=resource_cookies,
-                        last_proposer_response=last_proposer_response,
-                        state=state,
-                        rounds=rounds,
-                        loss_masked=True,
-                    )
-                executor_history.extend(item.model_dump() for item in executor_response.output)
-                executor_history.append(
-                    _message(
-                        build_format_retry_prompt(
-                            tag="predictions",
-                            expected_ids=list(train_inputs),
-                            error=training_result["parse_error"],
-                        )
-                    )
-                )
-
-            if self.config.confirm_mismatches and not training_result["all_exact"]:
-                confirmation_params = self._params(
-                    body,
-                    input_items=[executor_history[0]],
-                    max_tokens=self.config.executor_max_output_tokens,
-                    instructions=EXECUTOR_INSTRUCTIONS,
-                )
-                confirmation_params["temperature"] = 0.0
-                confirmation_response, _, confirmation_call = await self._recorded_model_call(
-                    request=request,
-                    role="executor_train_confirmation",
-                    server=self.config.executor_model_server,
-                    params=confirmation_params,
-                    cookies=None,
-                    run_body=body,
-                )
-                round_trace.executor_calls.append(confirmation_call)
-                confirmation, resource_cookies = await self._call_resource(
-                    url_path="/verify_training",
-                    payload={
-                        "response": confirmation_response.model_dump(),
-                        "record_result": False,
-                    },
-                    cookies=resource_cookies,
-                )
-                round_trace.training_verifications.append(confirmation)
-                if confirmation.get("predictions") != training_result.get("predictions"):
-                    training_result["feedback"] += (
-                        "\n\nExecutor instability: a deterministic confirmation produced different grids. "
-                        "Make the replacement description more operational."
-                    )
-
-            state = state.training_verified(all_exact=training_result["all_exact"])
-            if state.phase is EpisodePhase.EXECUTOR_TEST:
-                executor_history.extend(item.model_dump() for item in executor_response.output)
-                executor_history.append(_message(build_test_followup_prompt(test_inputs=test_inputs)))
-                test_params = self._params(
-                    body,
-                    input_items=executor_history,
-                    max_tokens=self.config.executor_max_output_tokens,
-                    instructions=EXECUTOR_INSTRUCTIONS,
-                )
-                try:
-                    test_response, _, test_call = await self._recorded_model_call(
-                        request=request,
-                        role="executor_test",
-                        server=self.config.executor_model_server,
-                        params=test_params,
-                        cookies=None,
-                        run_body=body,
-                    )
-                except Exception as error:
-                    if not _is_context_window_error(error):
-                        raise
-                    state = state.terminate(TerminationReason.EXECUTOR_CONTEXT_EXHAUSTED)
-                    return await self._finalize(
-                        body=body,
-                        cookies=resource_cookies,
-                        last_proposer_response=last_proposer_response,
-                        state=state,
-                        rounds=rounds,
-                        loss_masked=True,
-                    )
-                round_trace.executor_calls.append(test_call)
-                test_result, resource_cookies = await self._call_resource(
-                    url_path="/verify_test",
-                    payload={"response": test_response.model_dump()},
-                    cookies=resource_cookies,
-                )
-                round_trace.test_verification = test_result
-                if not test_result["format_valid"]:
-                    state = state.terminate(TerminationReason.EXECUTOR_FORMAT_FAILURE)
-                    loss_masked = True
-                else:
-                    state = state.test_answered()
-                    loss_masked = False
-                return await self._finalize(
-                    body=body,
-                    cookies=resource_cookies,
-                    last_proposer_response=last_proposer_response,
-                    state=state,
-                    rounds=rounds,
-                    loss_masked=loss_masked,
-                )
-
-            feedback = build_revision_prompt(training_result["feedback"])
-            round_trace.feedback = feedback
-            current_tokens = proposer_call.prompt_tokens + proposer_call.output_tokens
-            if not budget.permits_revision(
-                current_proposer_tokens=current_tokens,
-                next_feedback_tokens=conservative_text_token_bound(feedback),
-            ):
-                state = state.terminate(TerminationReason.CONTEXT_EXHAUSTED)
-                return await self._finalize(
-                    body=body,
-                    cookies=resource_cookies,
-                    last_proposer_response=last_proposer_response,
-                    state=state,
-                    rounds=rounds,
-                    loss_masked=False,
-                )
-            if state.round_index >= self.config.max_rounds:
-                state = state.terminate(TerminationReason.EMERGENCY_ROUND_CAP)
-                return await self._finalize(
-                    body=body,
-                    cookies=resource_cookies,
-                    last_proposer_response=last_proposer_response,
-                    state=state,
-                    rounds=rounds,
-                    loss_masked=False,
-                )
-            proposer_history.extend(item.model_dump() for item in proposer_response.output)
-            proposer_history.append(_message(feedback))
-
-        raise RuntimeError("ARC episode terminated without returning a verifier response")
+        state = state.terminate(loop_end)
+        return await self._finalize(
+            body=body,
+            cookies=resource_cookies,
+            last_proposer_response=last_proposer_response,
+            state=state,
+            rounds=rounds,
+            loss_masked=loss_masked,
+            protocol="hidden_test",
+        )
 
     async def _run_single_eval_executor(
         self,
@@ -754,6 +683,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                     state=state,
                     rounds=rounds,
                     loss_masked=True,
+                    protocol="eval_sequence",
                 )
             round_trace.transform_description = description
             state = state.description_generated()
@@ -779,6 +709,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                         state=state,
                         rounds=rounds,
                         loss_masked=True,
+                        protocol="eval_sequence",
                     )
                 if verification["exact"]:
                     grid_index += 1
@@ -791,6 +722,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                             state=state,
                             rounds=rounds,
                             loss_masked=False,
+                            protocol="eval_sequence",
                         )
                     continue
                 failed_verification = verification
@@ -813,6 +745,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                     state=state,
                     rounds=rounds,
                     loss_masked=False,
+                    protocol="eval_sequence",
                 )
             if state.round_index >= self.config.max_rounds:
                 state = state.terminate(TerminationReason.EMERGENCY_ROUND_CAP)
@@ -823,6 +756,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                     state=state,
                     rounds=rounds,
                     loss_masked=False,
+                    protocol="eval_sequence",
                 )
             proposer_history.extend(item.model_dump() for item in proposer_response.output)
             proposer_history.append(_message(feedback))

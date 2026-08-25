@@ -44,9 +44,11 @@ arc_transform_refinement_agent:
       executor_model_server:
         type: responses_api_models
         name: policy_model
-      # hidden_test (real-ARC: verify training pairs, then answer the hidden
-      # test) or eval_sequence (NVARC co-training: held-out grids solved one
-      # at a time, advance-on-solve, revise-on-fail).
+      # hidden_test (real-ARC: refine the rule against the demo pairs with
+      # fresh single-grid executor sessions, then answer the hidden test) or
+      # eval_sequence (NVARC co-training: held-out grids solved one at a
+      # time, advance-on-solve, revise-on-fail). A task row may override
+      # this per episode via its own protocol field.
       protocol: hidden_test
       model_context_limit: 32768
       reserved_proposer_output_tokens: 4096
@@ -54,7 +56,6 @@ arc_transform_refinement_agent:
       proposer_max_output_tokens: 4096
       executor_max_output_tokens: 4096
       max_rounds: 32
-      confirm_mismatches: false
       datasets:
       - name: training_1
         type: validation

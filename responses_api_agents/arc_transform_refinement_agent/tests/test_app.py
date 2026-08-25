@@ -64,231 +64,6 @@ class _SeedResponse:
     cookies = {"session": "seeded"}
 
 
-class MockArcAgent(ArcTransformRefinementAgent):
-    def set_model_responses(self, responses: list[NeMoGymResponse]) -> None:
-        object.__setattr__(self, "model_responses", list(responses))
-        object.__setattr__(self, "model_requests", [])
-
-    async def _call_model(self, *, request, server, params, cookies, run_body):
-        self.model_requests.append((server.name, params))
-        return self.model_responses.pop(0), {}
-
-    async def _call_resource(self, *, url_path, payload, cookies):
-        self.resource_requests.append((url_path, payload))
-        if url_path == "/verify_training":
-            return self.training_results.pop(0), cookies
-        if url_path == "/verify_test":
-            return self.test_results.pop(0), cookies
-        if url_path == "/finalize":
-            response = {
-                "responses_create_params": payload["responses_create_params"],
-                "response": payload["response"],
-                "reward": float(self.final_test_exact),
-                "termination_reason": payload["termination_reason"],
-                "loss_masked": payload["loss_masked"],
-                "trace": payload["trace"],
-                "test_exact": self.final_test_exact,
-            }
-            return response, cookies
-        raise AssertionError(f"unexpected resource path {url_path}")
-
-
-def _agent(
-    model_responses,
-    training_results,
-    test_results=(),
-    *,
-    config: ArcTransformRefinementAgentConfig | None = None,
-) -> MockArcAgent:
-    agent = MockArcAgent(
-        config=config or _config(),
-        server_client=MagicMock(spec=ServerClient),
-    )
-    agent.server_client.post = AsyncMock(return_value=_SeedResponse())
-    agent.set_model_responses(model_responses)
-    object.__setattr__(agent, "training_results", list(training_results))
-    object.__setattr__(agent, "test_results", list(test_results))
-    object.__setattr__(agent, "resource_requests", [])
-    object.__setattr__(
-        agent,
-        "final_test_exact",
-        bool(test_results and test_results[-1].get("all_exact")),
-    )
-    return agent
-
-
-def _body() -> ArcTransformRunRequest:
-    return ArcTransformRunRequest(
-        responses_create_params={"input": [], "temperature": 0.0},
-        train=[{"input": [[1, 0]], "output": [[0, 1]]}],
-        test=[{"input": [[3, 0]], "output": [[0, 8]]}],
-        task_id="mock-task",
-    )
-
-
-async def test_two_round_agent_isolates_histories_and_returns_only_final_proposer() -> None:
-    proposer_v0 = _response(
-        "<transform_description>Keep the grid unchanged.</transform_description>",
-        prompt_tokens=100,
-        generation_tokens=12,
-    )
-    executor_v0 = _response(
-        '<predictions>{"train_0": [[1, 0]]}</predictions>',
-        prompt_tokens=80,
-        generation_tokens=8,
-    )
-    proposer_v1 = _response(
-        "<transform_description>Reverse every row.</transform_description>",
-        prompt_tokens=180,
-        generation_tokens=12,
-    )
-    executor_v1 = _response(
-        '<predictions>{"train_0": [[0, 1]]}</predictions>',
-        prompt_tokens=82,
-        generation_tokens=8,
-    )
-    test_answer = _response(
-        '<answers>{"test_0": [[0, 8]]}</answers>',
-        prompt_tokens=100,
-        generation_tokens=8,
-    )
-    agent = _agent(
-        [proposer_v0, executor_v0, proposer_v1, executor_v1, test_answer],
-        [
-            {
-                "format_valid": True,
-                "all_exact": False,
-                "feedback": "Example train_0: mismatch\nDiff (predicted-correct):\n1-0 0-1",
-                "parse_error": None,
-                "predictions": {"train_0": [[1, 0]]},
-            },
-            {
-                "format_valid": True,
-                "all_exact": True,
-                "feedback": "Example train_0: exact.",
-                "parse_error": None,
-                "predictions": {"train_0": [[0, 1]]},
-            },
-        ],
-        [
-            {
-                "format_valid": True,
-                "all_exact": True,
-                "feedback": "Example test_0: exact.",
-                "parse_error": None,
-            }
-        ],
-    )
-    request = MagicMock(spec=Request)
-    request.cookies = {}
-
-    result = await agent.run(request, _body())
-
-    assert result.reward == 1.0
-    assert result.termination_reason == "train_verified"
-    assert not result.loss_masked
-    assert result.response.output[0].content[0].text == proposer_v1.output[0].content[0].text
-
-    roles = [name for name, _ in agent.model_requests]
-    assert roles == ["proposer", "executor", "proposer", "executor", "executor"]
-    assert "rule proposer" in agent.model_requests[0][1]["instructions"]
-    assert "literal ARC transformation executor" in agent.model_requests[1][1]["instructions"]
-    assert agent.model_requests[0][1]["instructions"] != agent.model_requests[1][1]["instructions"]
-    second_proposer_input = agent.model_requests[2][1]["input"]
-    serialized_second_proposer = json.dumps(second_proposer_input)
-    assert "Keep the grid unchanged" in serialized_second_proposer
-    assert "predicted-correct" in serialized_second_proposer
-    assert '<predictions>{"train_0": [[1, 0]]}' not in serialized_second_proposer
-
-    first_executor_input = agent.model_requests[1][1]["input"]
-    second_executor_input = agent.model_requests[3][1]["input"]
-    assert len(first_executor_input) == 1
-    assert len(second_executor_input) == 1
-    assert "Keep the grid unchanged" in first_executor_input[0]["content"]
-    assert "Reverse every row" in second_executor_input[0]["content"]
-
-    all_model_requests = json.dumps([payload for _, payload in agent.model_requests])
-    assert "[[0, 8]]" not in all_model_requests
-    finalize_payload = agent.resource_requests[-1][1]
-    assert finalize_payload["response"] == proposer_v1.model_dump()
-    assert finalize_payload["trace"]["policy_loss"]["round_index"] == 1
-    assert finalize_payload["trace"]["policy_loss"]["role"] == "proposer"
-
-
-async def test_executor_gets_one_format_retry_then_masks_episode() -> None:
-    proposer = _response(
-        "<transform_description>Reverse every row.</transform_description>",
-        prompt_tokens=100,
-        generation_tokens=10,
-    )
-    invalid_first = _response("[[0, 1]]", prompt_tokens=80, generation_tokens=4)
-    invalid_second = _response("still invalid", prompt_tokens=100, generation_tokens=4)
-    agent = _agent(
-        [proposer, invalid_first, invalid_second],
-        [
-            {
-                "format_valid": False,
-                "all_exact": False,
-                "feedback": "Executor format failure",
-                "parse_error": "missing predictions tags",
-                "predictions": None,
-            },
-            {
-                "format_valid": False,
-                "all_exact": False,
-                "feedback": "Executor format failure",
-                "parse_error": "still invalid",
-                "predictions": None,
-            },
-        ],
-    )
-    request = MagicMock(spec=Request)
-    request.cookies = {}
-
-    result = await agent.run(request, _body())
-
-    assert result.termination_reason == "executor_format_failure"
-    assert result.loss_masked
-    assert len(agent.model_requests) == 3
-    retry_input = agent.model_requests[2][1]["input"]
-    assert len(retry_input) == 3
-    assert "Do not change or reinterpret the transformation" in retry_input[-1]["content"]
-
-
-async def test_context_budget_stops_before_another_proposer_turn_without_masking() -> None:
-    proposer = _response(
-        "<transform_description>Keep the grid unchanged.</transform_description>",
-        prompt_tokens=100,
-        generation_tokens=10,
-    )
-    executor = _response(
-        '<predictions>{"train_0": [[1, 0]]}</predictions>',
-        prompt_tokens=80,
-        generation_tokens=8,
-    )
-    agent = _agent(
-        [proposer, executor],
-        [
-            {
-                "format_valid": True,
-                "all_exact": False,
-                "feedback": "Example train_0: mismatch\nDiff (predicted-correct):\n1-0 0-1",
-                "parse_error": None,
-                "predictions": {"train_0": [[1, 0]]},
-            }
-        ],
-        config=_config(model_context_limit=300),
-    )
-    request = MagicMock(spec=Request)
-    request.cookies = {}
-
-    result = await agent.run(request, _body())
-
-    assert result.termination_reason == "context_exhausted"
-    assert not result.loss_masked
-    assert len(agent.model_requests) == 2
-
-
 def test_config_rejects_invalid_context_reservation() -> None:
     try:
         _config(model_context_limit=100, reserved_proposer_output_tokens=90, chat_template_margin=10)
@@ -333,9 +108,14 @@ class MockEvalAgent(ArcTransformRefinementAgent):
         raise AssertionError(f"unexpected resource path {url_path}")
 
 
-def _eval_agent(model_responses, eval_results) -> MockEvalAgent:
+def _eval_agent(
+    model_responses,
+    eval_results,
+    *,
+    config: ArcTransformRefinementAgentConfig | None = None,
+) -> MockEvalAgent:
     agent = MockEvalAgent(
-        config=_config(protocol="eval_sequence"),
+        config=config or _config(protocol="eval_sequence"),
         server_client=MagicMock(spec=ServerClient),
     )
     agent.server_client.post = AsyncMock(return_value=_SeedResponse())
@@ -470,3 +250,201 @@ async def test_eval_sequence_masks_non_canonical_proposer_output() -> None:
     assert result.termination_reason == "agent_error"
     assert result.loss_masked
     assert len(agent.model_requests) == 1
+
+
+REVISED_RULE = (
+    "<rules_summary>Reverse each row and recolor.</rules_summary>\n"
+    "<solution_steps>Reverse the cell order of every row, keep colors.</solution_steps>\n"
+    "<key_insight>Only the horizontal order changes.</key_insight>\n"
+    "<puzzle_concepts>reversal</puzzle_concepts>"
+)
+
+
+def _hidden_agent(model_responses, eval_results, **config_overrides) -> MockEvalAgent:
+    return _eval_agent(model_responses, eval_results, config=_config(**config_overrides))
+
+
+def _hidden_body() -> ArcTransformRunRequest:
+    return ArcTransformRunRequest(
+        responses_create_params={"input": [], "temperature": 0.0},
+        train=[{"input": [[1, 0]], "output": [[0, 1]]}],
+        test=[{"input": [[3, 0]], "output": [[0, 3]]}],
+        task_id="hidden-task",
+    )
+
+
+def _demo_miss(evidence: str) -> dict:
+    return {
+        "grid_id": "train_0",
+        "format_valid": True,
+        "exact": False,
+        "feedback": "mismatch",
+        "revision_feedback": evidence,
+    }
+
+
+def _exact(grid_id: str) -> dict:
+    return {"grid_id": grid_id, "format_valid": True, "exact": True, "feedback": "exact", "revision_feedback": None}
+
+
+async def test_hidden_test_refines_on_demos_then_answers_the_hidden_test() -> None:
+    evidence = "EVIDENCE train_0: expected differs"
+    agent = _hidden_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n1 0\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response(REVISED_RULE, prompt_tokens=160, generation_tokens=20),
+            _response("<answer>\n0 1\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [_demo_miss(evidence), _exact("train_0"), _exact("test_0")],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _hidden_body())
+
+    assert result.termination_reason == "train_verified"
+    assert not result.loss_masked
+    roles = [name for name, _ in agent.model_requests]
+    assert roles == ["proposer", "executor", "proposer", "executor", "executor"]
+
+    # Executor calls: fresh single-grid sessions, one user message, no
+    # instructions (byte-parity with native executor training rows).
+    for index in (1, 3, 4):
+        _, params = agent.model_requests[index]
+        assert "instructions" not in params
+        assert len(params["input"]) == 1
+        assert "<transformation>" in params["input"][0]["content"]
+    # The final test call applies the revised rule to the hidden test input.
+    final_call = agent.model_requests[4][1]["input"][0]["content"]
+    assert "3 0" in final_call
+    assert "recolor" in final_call
+
+    # The revision proposer turn carries the server-rendered evidence.
+    assert evidence in json.dumps(agent.model_requests[2][1]["input"])
+
+    # The hidden test target never appears in any model request.
+    all_model_requests = json.dumps([payload for _, payload in agent.model_requests])
+    assert "[[0, 3]]" not in all_model_requests
+    assert "0 3" not in json.dumps(agent.model_requests[0][1])
+
+    # Verified grid ids: the demo twice, then the hidden test once.
+    verify_ids = [payload["grid_id"] for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert verify_ids == ["train_0", "train_0", "test_0"]
+
+    finalize_payload = agent.resource_requests[-1][1]
+    assert finalize_payload["protocol"] == "hidden_test"
+    assert finalize_payload["response"]["output"][0]["content"][0]["text"] == REVISED_RULE
+    assert finalize_payload["trace"]["policy_loss"]["round_index"] == 1
+
+
+async def test_hidden_test_budget_exhaustion_still_answers_the_test() -> None:
+    evidence = "EVIDENCE train_0: expected differs, with enough bytes to overflow the tiny budget"
+    agent = _hidden_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n1 0\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [_demo_miss(evidence), _exact("test_0")],
+        model_context_limit=300,
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _hidden_body())
+
+    assert result.termination_reason == "context_exhausted"
+    assert not result.loss_masked
+    # The demo loop ended on budget, but the hidden test was still answered
+    # with the current rule.
+    verify_ids = [payload["grid_id"] for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert verify_ids == ["train_0", "test_0"]
+
+
+async def test_hidden_test_masks_double_executor_format_failure_without_answering() -> None:
+    failure = {
+        "grid_id": "train_0",
+        "format_valid": False,
+        "exact": False,
+        "feedback": "format",
+        "parse_error": "no grid",
+        "revision_feedback": None,
+    }
+    agent = _hidden_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("no grid", prompt_tokens=60, generation_tokens=4),
+            _response("still no grid", prompt_tokens=70, generation_tokens=4),
+        ],
+        [failure, dict(failure)],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _hidden_body())
+
+    assert result.termination_reason == "executor_format_failure"
+    assert result.loss_masked
+    verify_ids = [payload["grid_id"] for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert verify_ids == ["train_0", "train_0"]  # the hidden test was never reached
+
+
+async def test_hidden_test_unparseable_first_rule_is_agent_error() -> None:
+    agent = _hidden_agent(
+        [_response("not a rule", prompt_tokens=90, generation_tokens=8)],
+        [],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _hidden_body())
+
+    assert result.termination_reason == "agent_error"
+    assert result.loss_masked
+    assert len(agent.model_requests) == 1
+
+
+async def test_hidden_test_parse_failure_falls_back_to_the_prior_rule() -> None:
+    evidence = "EVIDENCE train_0: expected differs"
+    agent = _hidden_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n1 0\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response("not a rule anymore", prompt_tokens=160, generation_tokens=8),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [_demo_miss(evidence), _exact("test_0")],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _hidden_body())
+
+    assert result.termination_reason == "agent_error"
+    assert result.loss_masked
+    # The hidden test was still answered, using the first (valid) rule.
+    final_call = agent.model_requests[-1][1]["input"][0]["content"]
+    assert "3 0" in final_call
+    assert "Reverse each row." in final_call
+
+
+async def test_row_protocol_overrides_the_config_default() -> None:
+    """A hidden_test-configured agent runs eval_sequence when the row says so."""
+    agent = _hidden_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [_exact("test_0")],
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+    body = _hidden_body().model_copy(update={"protocol": "eval_sequence"})
+
+    result = await agent.run(request, body)
+
+    assert result.termination_reason == "all_solved"
+    finalize_payload = agent.resource_requests[-1][1]
+    assert finalize_payload["protocol"] == "eval_sequence"

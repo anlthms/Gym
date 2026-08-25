@@ -34,14 +34,11 @@ from nemo_gym.base_resources_server import (
 from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.server_utils import SESSION_ID_KEY
 from resources_servers.arc_agi_2.logic import (
-    BatchVerification,
     Grid,
     PredictionParseError,
     build_eval_feedback_prompt,
     compare_grid,
-    parse_tagged_grids,
     validate_grid,
-    verify_predictions,
 )
 from resources_servers.arc_agi_2.scoring import (
     RewardWeights,
@@ -184,13 +181,6 @@ class ARCAGIVerifyRequest(BaseVerifyRequest):
         return validate_grid(self.expected_output, grid_id="test_0 output")
 
 
-class ExecutorVerificationRequest(BaseModel):
-    """One executor response to parse against session-owned targets."""
-
-    response: NeMoGymResponse
-    record_result: bool = True
-
-
 class EvalGridVerificationRequest(BaseModel):
     """One fresh single-grid executor response for one evaluation grid."""
 
@@ -216,32 +206,6 @@ class EvalGridVerificationResponse(BaseModel):
     feedback: str
     revision_feedback: str | None = None
     terms: dict[str, float] = Field(default_factory=dict)
-
-
-class GridVerificationRecord(BaseModel):
-    """Serializable form of one deterministic grid comparison."""
-
-    grid_id: str
-    predicted: Grid
-    correct: Grid
-    exact: bool
-    shape_match: bool
-    cell_accuracy: float
-    feedback: str
-
-
-class ExecutorVerificationResponse(BaseModel):
-    """Strict parse and deterministic comparison returned to the agent."""
-
-    format_valid: bool
-    parse_error: str | None = None
-    all_exact: bool = False
-    exact_fraction: float = 0.0
-    shape_match_fraction: float = 0.0
-    cell_accuracy: float = 0.0
-    feedback: str
-    predictions: dict[str, Grid] | None = None
-    records: list[GridVerificationRecord] = Field(default_factory=list)
 
 
 class ARCAGIFinalizeRequest(BaseVerifyRequest):
@@ -300,10 +264,9 @@ class ARCSessionState:
     train_targets: dict[str, Grid]
     test_inputs: dict[str, Grid]
     test_targets: dict[str, Grid]
-    train_results: list[BatchVerification]
-    test_result: BatchVerification | None
-    # Per-evaluation-grid attempt score terms, keyed by grid id
-    # (eval_sequence protocol).
+    # Per-grid attempt score terms, keyed by grid id. eval_sequence episodes
+    # record held-out test grids; hidden_test episodes record demo (train)
+    # grids during refinement and test grids for the final answers.
     eval_results: dict[str, list[dict[str, float]]]
 
 
@@ -338,30 +301,6 @@ def _parse_grid(text: str) -> Grid | None:
     return None
 
 
-def _verification_response(result: BatchVerification, predictions: dict[str, Grid]) -> ExecutorVerificationResponse:
-    return ExecutorVerificationResponse(
-        format_valid=True,
-        all_exact=result.all_exact,
-        exact_fraction=result.exact_fraction,
-        shape_match_fraction=result.shape_match_fraction,
-        cell_accuracy=result.cell_accuracy,
-        feedback=result.feedback,
-        predictions=predictions,
-        records=[
-            {
-                "grid_id": record.grid_id,
-                "predicted": record.predicted,
-                "correct": record.correct,
-                "exact": record.exact,
-                "shape_match": record.shape_match,
-                "cell_accuracy": record.cell_accuracy,
-                "feedback": record.feedback,
-            }
-            for record in result.records
-        ],
-    )
-
-
 class ARCAGIResourcesServer(SimpleResourcesServer):
     """Own ARC targets and expose strict train/test verification endpoints."""
 
@@ -373,8 +312,6 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
-        app.post("/verify_training")(self.verify_training)
-        app.post("/verify_test")(self.verify_test)
         app.post("/verify_eval_grid")(self.verify_eval_grid)
         app.post("/finalize")(self.finalize)
         return app
@@ -388,8 +325,6 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             train_targets={f"train_{index}": pair.output for index, pair in enumerate(body.train)},
             test_inputs={f"test_{index}": pair.input for index, pair in enumerate(tests)},
             test_targets={f"test_{index}": pair.output for index, pair in enumerate(tests)},
-            train_results=[],
-            test_result=None,
             eval_results={},
         )
         return BaseSeedSessionResponse()
@@ -400,51 +335,28 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             raise HTTPException(status_code=400, detail="ARC session is not initialized; call seed_session first")
         return self._sessions[session_id]
 
-    async def verify_training(
-        self,
-        request: Request,
-        body: ExecutorVerificationRequest,
-    ) -> ExecutorVerificationResponse:
-        session = self._session(request)
-        return self._verify_executor_response(
-            body.response,
-            tag="predictions",
-            targets=session.train_targets,
-            store_on=session,
-            is_test=False,
-            record_result=body.record_result,
-        )
-
-    async def verify_test(
-        self,
-        request: Request,
-        body: ExecutorVerificationRequest,
-    ) -> ExecutorVerificationResponse:
-        session = self._session(request)
-        return self._verify_executor_response(
-            body.response,
-            tag="answers",
-            targets=session.test_targets,
-            store_on=session,
-            is_test=True,
-            record_result=body.record_result,
-        )
-
     async def verify_eval_grid(
         self,
         request: Request,
         body: EvalGridVerificationRequest,
     ) -> EvalGridVerificationResponse:
-        """Verify one fresh single-grid ``<answer>`` response for one evaluation grid.
+        """Verify one fresh single-grid ``<answer>`` response for one grid.
 
-        Scores with the shared gain-over-echo terms (the grid's own input is
-        the echo baseline) and records the attempt for finalize aggregation.
+        Resolves the grid id in the hidden test pool first, then the demo
+        (train) pool -- hidden_test episodes verify demo grids during
+        refinement and test grids for the final answers. Scores with the
+        shared gain-over-echo terms (the grid's own input is the echo
+        baseline) and records the attempt for finalize aggregation.
         """
         session = self._session(request)
-        if body.grid_id not in session.test_targets:
+        if body.grid_id in session.test_targets:
+            target = session.test_targets[body.grid_id]
+            echo_input = session.test_inputs[body.grid_id]
+        elif body.grid_id in session.train_targets:
+            target = session.train_targets[body.grid_id]
+            echo_input = session.train_inputs[body.grid_id]
+        else:
             raise HTTPException(status_code=400, detail=f"unknown evaluation grid {body.grid_id!r}")
-        target = session.test_targets[body.grid_id]
-        echo_input = session.test_inputs[body.grid_id]
         text = _extract_assistant_text(body.response)
         predicted = extract_answer_grid(text)
         terms = score_grid(predicted, target, echo_input, self.config.reward_weights())
@@ -478,69 +390,61 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             terms=terms,
         )
 
-    def _verify_executor_response(
-        self,
-        response: NeMoGymResponse,
-        *,
-        tag: str,
-        targets: dict[str, Grid],
-        store_on: ARCSessionState,
-        is_test: bool,
-        record_result: bool,
-    ) -> ExecutorVerificationResponse:
-        text = _extract_assistant_text(response)
-        try:
-            predictions = parse_tagged_grids(text, tag=tag, expected_ids=list(targets))
-        except PredictionParseError as error:
-            return ExecutorVerificationResponse(
-                format_valid=False,
-                parse_error=str(error),
-                feedback=f"Executor format failure: {error}",
-            )
-        result = verify_predictions(predictions=predictions, correct=targets)
-        if record_result:
-            if is_test:
-                store_on.test_result = result
-            else:
-                store_on.train_results.append(result)
-        return _verification_response(result, predictions)
-
     async def finalize(self, request: Request, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:
         session = self._session(request)
         if body.protocol == "eval_sequence":
             return self._finalize_eval_sequence(session, body)
-        train_result = (
-            max(
-                session.train_results,
-                key=lambda result: (result.exact_fraction, result.cell_accuracy),
-            )
-            if session.train_results
-            else None
-        )
-        test_result = session.test_result
-        train_gate_pass = any(result.all_exact for result in session.train_results)
-        test_exact = bool(test_result and test_result.all_exact)
+        return self._finalize_hidden_test(session, body)
+
+    def _finalize_hidden_test(self, session: ARCSessionState, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:
+        """Score the final hidden-test answers of a real-ARC episode.
+
+        Each test grid is scored on its LAST recorded attempt -- the answer
+        the episode actually committed to (a format retry replaces the failed
+        first attempt). Unanswered test grids sit at the reward floor. The
+        demo-refinement loop contributes diagnostics only: ``train_gate_pass``
+        (every demo grid verified exactly at some point) and
+        ``train_exact_fraction``.
+        """
+        floor = reward_floor(self.config.reward_weights())
+        per_grid_rewards: list[float] = []
+        per_grid_exact: list[float] = []
+        per_grid_cell: list[float] = []
+        per_grid_format: list[float] = []
+        for grid_id in session.test_targets:
+            attempts = session.eval_results.get(grid_id, [])
+            if attempts:
+                final = attempts[-1]
+                per_grid_rewards.append(final["reward"])
+                per_grid_exact.append(final["grid_match"])
+                per_grid_cell.append(final["cell_match"])
+                per_grid_format.append(final["format_valid"])
+            else:
+                per_grid_rewards.append(floor)
+                per_grid_exact.append(0.0)
+                per_grid_cell.append(0.0)
+                per_grid_format.append(0.0)
+        count = len(per_grid_rewards)
+        demo_solved = [
+            float(any(attempt["grid_match"] for attempt in session.eval_results.get(grid_id, [])))
+            for grid_id in session.train_targets
+        ]
+        grid_match = sum(per_grid_exact) / count if count else 0.0
         return ARCAGIVerifyResponse(
             **body.model_dump(exclude={"termination_reason", "loss_masked", "protocol", "trace"}),
-            reward=float(test_exact),
+            reward=sum(per_grid_rewards) / count if count else floor,
             task_id=session.task_id,
             termination_reason=body.termination_reason,
             loss_masked=body.loss_masked,
             instance_config={"mask_sample": body.loss_masked},
-            train_gate_pass=train_gate_pass,
-            test_exact=test_exact,
-            test_cell_accuracy=test_result.cell_accuracy if test_result else 0.0,
-            train_exact_fraction=train_result.exact_fraction if train_result else 0.0,
-            train_cell_accuracy=train_result.cell_accuracy if train_result else 0.0,
+            train_gate_pass=bool(demo_solved) and all(demo_solved),
+            test_exact=count > 0 and grid_match == 1.0,
+            grid_match=grid_match,
+            cell_match=sum(per_grid_cell) / count if count else 0.0,
+            format_valid=sum(per_grid_format) / count if count else 0.0,
+            train_exact_fraction=(sum(demo_solved) / len(demo_solved)) if demo_solved else 0.0,
             rounds_used=len(body.trace.get("rounds", [])),
             trace=body.trace,
-            predicted_output=(
-                test_result.records[0].predicted if test_result and len(test_result.records) == 1 else None
-            ),
-            expected_output=(
-                test_result.records[0].correct if test_result and len(test_result.records) == 1 else None
-            ),
-            extraction_successful=test_result is not None,
         )
 
     def _finalize_eval_sequence(self, session: ARCSessionState, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:

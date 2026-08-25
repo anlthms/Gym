@@ -4,60 +4,16 @@ from resources_servers.arc_agi_2.logic import (
     ContextBudget,
     EpisodePhase,
     EpisodeState,
-    PredictionParseError,
     TerminationReason,
     TransformDescriptionParseError,
     assert_model_request_safe,
     build_eval_feedback_prompt,
-    build_executor_prompt,
     build_nvarc_proposer_prompt,
-    build_proposer_prompt,
     build_single_executor_prompt,
     compare_grid,
     conservative_text_token_bound,
     parse_canonical_rule,
-    parse_tagged_grids,
-    parse_transform_description,
-    verify_predictions,
 )
-
-
-def test_parse_tagged_grids_accepts_exact_contract() -> None:
-    parsed = parse_tagged_grids(
-        '<predictions>{"train_0": [[0, 2], [2, 0]]}</predictions>',
-        tag="predictions",
-        expected_ids=["train_0"],
-    )
-    assert parsed == {"train_0": [[0, 2], [2, 0]]}
-
-
-@pytest.mark.parametrize(
-    ("text", "match"),
-    [
-        ('prose <predictions>{"train_0": [[1]]}</predictions>', "contain only"),
-        ('<predictions>{"train_0": [[1]], "extra": [[1]]}</predictions>', "extra"),
-        ('<predictions>{"train_0": [[true]]}</predictions>', "integer"),
-        ('<predictions>{"train_0": [[10]]}</predictions>', "integer"),
-        ('<predictions>{"train_0": [[1], [2, 3]]}</predictions>', "ragged"),
-        ('<predictions>{"train_0": []}</predictions>', "non-empty"),
-    ],
-)
-def test_parse_tagged_grids_rejects_invalid_contract(text: str, match: str) -> None:
-    with pytest.raises(PredictionParseError, match=match):
-        parse_tagged_grids(text, tag="predictions", expected_ids=["train_0"])
-
-
-def test_parse_transform_description_is_single_non_python_block() -> None:
-    assert (
-        parse_transform_description("<transform_description>Reverse every row.</transform_description>")
-        == "Reverse every row."
-    )
-    with pytest.raises(ValueError, match="only one"):
-        parse_transform_description("Explanation: <transform_description>Reverse rows.</transform_description>")
-    with pytest.raises(ValueError, match="Python"):
-        parse_transform_description(
-            "<transform_description>```python\ndef solve(grid): pass\n```</transform_description>"
-        )
 
 
 def test_compare_grid_renders_every_aligned_cell_as_predicted_correct() -> None:
@@ -83,18 +39,7 @@ def test_compare_grid_reports_shape_without_cell_diff() -> None:
     assert "Diff" not in record.feedback
 
 
-def test_verify_predictions_aggregates_all_requested_grids() -> None:
-    result = verify_predictions(
-        predictions={"train_0": [[1]], "train_1": [[0, 1]]},
-        correct={"train_0": [[1]], "train_1": [[0, 2]]},
-    )
-    assert not result.all_exact
-    assert result.exact_fraction == 0.5
-    assert result.shape_match_fraction == 1.0
-    assert result.cell_accuracy == 0.75
-
-
-def test_episode_state_machine_success_and_format_failure() -> None:
+def test_episode_state_machine_format_failure_allows_one_retry() -> None:
     state = EpisodeState.initial()
     assert state.phase is EpisodePhase.PROPOSER
     state = state.description_generated()
@@ -104,19 +49,26 @@ def test_episode_state_machine_success_and_format_failure() -> None:
     assert state.phase is EpisodePhase.TERMINATED
     assert state.termination_reason is TerminationReason.EXECUTOR_FORMAT_FAILURE
 
+
+def test_hidden_test_state_transitions() -> None:
     state = EpisodeState.initial().description_generated()
-    state = state.training_verified(all_exact=False)
-    assert state.phase is EpisodePhase.PROPOSER
-    assert state.round_index == 1
-    state = state.description_generated().training_verified(all_exact=True)
-    assert state.phase is EpisodePhase.EXECUTOR_TEST
-    state = state.test_answered()
-    assert state.termination_reason is TerminationReason.TRAIN_VERIFIED
+    # All demos verified: enter the hidden-test phase.
+    tested = state.demos_verified()
+    assert tested.phase is EpisodePhase.EXECUTOR_TEST
+    done = tested.terminate(TerminationReason.TRAIN_VERIFIED)
+    assert done.termination_reason is TerminationReason.TRAIN_VERIFIED
+
+    # A budget guard fires between rounds: still answer the hidden test.
+    exhausted = state.eval_grid_failed().demo_loop_exhausted()
+    assert exhausted.phase is EpisodePhase.EXECUTOR_TEST
+    assert exhausted.round_index == 1
 
 
 def test_episode_state_machine_rejects_invalid_transition() -> None:
-    with pytest.raises(RuntimeError, match="expected episode phase executor_test"):
-        EpisodeState.initial().test_answered()
+    with pytest.raises(RuntimeError, match="expected episode phase executor_train"):
+        EpisodeState.initial().demos_verified()
+    with pytest.raises(RuntimeError, match="expected episode phase proposer"):
+        EpisodeState.initial().description_generated().demo_loop_exhausted()
 
 
 def test_context_budget_accounts_for_feedback_output_and_margin() -> None:
@@ -134,20 +86,6 @@ def test_leakage_guard_rejects_nested_verifier_fields() -> None:
     assert_model_request_safe({"input": [{"role": "user", "content": "safe"}]})
     with pytest.raises(ValueError, match="expected_output"):
         assert_model_request_safe({"input": [{"metadata": {"expected_output": [[9]]}}]})
-
-
-def test_prompts_separate_public_and_hidden_fields() -> None:
-    train = [{"input": [[1, 0]], "output": [[0, 1]]}]
-    proposer = build_proposer_prompt(train_pairs=train, test_inputs=[[[2, 0]]])
-    executor = build_executor_prompt(
-        description="Reverse each row.",
-        inputs={"train_0": [[1, 0]]},
-        tag="predictions",
-    )
-    assert "0 1" in proposer
-    assert "Test input test_0" in proposer
-    assert "0 1" not in executor
-    assert "train_0" in executor
 
 
 def test_parse_canonical_rule_rerenders_in_canonical_order() -> None:
@@ -241,5 +179,3 @@ def test_eval_sequence_state_transitions() -> None:
     assert failed.round_index == 1
     done = state.eval_grid_solved(all_solved=True)
     assert done.termination_reason is TerminationReason.ALL_SOLVED
-    reset = state.next_grid()
-    assert not reset.format_retry_used

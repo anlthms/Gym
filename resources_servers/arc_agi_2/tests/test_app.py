@@ -25,7 +25,6 @@ from resources_servers.arc_agi_2.app import (
     ARCAGIRunRequest,
     ARCAGIVerifyRequest,
     EvalGridVerificationRequest,
-    ExecutorVerificationRequest,
     _parse_grid,
 )
 
@@ -55,110 +54,6 @@ class TestApp:
 
         result = _parse_grid("")
         assert result is None
-
-    async def test_session_verification_keeps_targets_server_side(self) -> None:
-        config = ARCAGIResourcesServerConfig(
-            host="127.0.0.1",
-            port=8080,
-            entrypoint="app.py",
-            name="test_arc_agi_2",
-        )
-        server = ARCAGIResourcesServer(
-            config=config,
-            server_client=MagicMock(spec=ServerClient),
-        )
-        request = MagicMock(spec=Request)
-        request.session = {"session_id": "arc-test"}
-        run_request = ARCAGIRunRequest(
-            responses_create_params={"input": []},
-            train=[{"input": [[1, 0]], "output": [[0, 1]]}],
-            test=[{"input": [[2, 0]], "output": [[0, 2]]}],
-            task_id="task",
-        )
-        await server.seed_session(request, run_request)
-
-        model_response = NeMoGymResponse.model_validate(
-            {
-                "id": "response",
-                "created_at": 0.0,
-                "model": "mock",
-                "object": "response",
-                "output": [
-                    {
-                        "id": "message",
-                        "content": [
-                            {
-                                "annotations": [],
-                                "text": '<predictions>{"train_0": [[0, 1]]}</predictions>',
-                                "type": "output_text",
-                            }
-                        ],
-                        "role": "assistant",
-                        "status": "completed",
-                        "type": "message",
-                    }
-                ],
-                "parallel_tool_calls": False,
-                "tool_choice": "auto",
-                "tools": [],
-            }
-        )
-        result = await server.verify_training(
-            request,
-            ExecutorVerificationRequest(response=model_response),
-        )
-        assert result.format_valid
-        assert result.all_exact
-        assert server._sessions["arc-test"].test_targets == {"test_0": [[0, 2]]}
-
-    async def test_training_parse_failure_is_not_misdiagnosed_as_rule_failure(self) -> None:
-        config = ARCAGIResourcesServerConfig(
-            host="127.0.0.1",
-            port=8080,
-            entrypoint="app.py",
-            name="test_arc_agi_2",
-        )
-        server = ARCAGIResourcesServer(
-            config=config,
-            server_client=MagicMock(spec=ServerClient),
-        )
-        request = MagicMock(spec=Request)
-        request.session = {"session_id": "arc-format"}
-        await server.seed_session(
-            request,
-            ARCAGIRunRequest(
-                responses_create_params={"input": []},
-                train=[{"input": [[1]], "output": [[2]]}],
-                test=[{"input": [[3]], "output": [[4]]}],
-            ),
-        )
-        response = NeMoGymResponse.model_validate(
-            {
-                "id": "response",
-                "created_at": 0.0,
-                "model": "mock",
-                "object": "response",
-                "output": [
-                    {
-                        "id": "message",
-                        "content": [{"annotations": [], "text": "[[2]]", "type": "output_text"}],
-                        "role": "assistant",
-                        "status": "completed",
-                        "type": "message",
-                    }
-                ],
-                "parallel_tool_calls": False,
-                "tool_choice": "auto",
-                "tools": [],
-            }
-        )
-        result = await server.verify_training(
-            request,
-            ExecutorVerificationRequest(response=response),
-        )
-        assert not result.format_valid
-        assert result.parse_error is not None
-        assert not server._sessions["arc-format"].train_results
 
 
 def _server() -> ARCAGIResourcesServer:
@@ -299,6 +194,96 @@ class TestEvalSequence:
         server, request = await self._seeded("eval-mask")
         result = await server.finalize(request, _finalize_request(protocol="eval_sequence", loss_masked=True))
         assert result.loss_masked
+        assert result.instance_config == {"mask_sample": True}
+
+
+class TestHiddenTest:
+    """The real-ARC protocol: demo grids verified during refinement, hidden
+    test grids scored on their final answers."""
+
+    async def _seeded(self, session_id: str) -> tuple[ARCAGIResourcesServer, Request]:
+        server = _server()
+        request = _request(session_id)
+        await server.seed_session(
+            request,
+            ARCAGIRunRequest(
+                responses_create_params={"input": []},
+                train=[
+                    {"input": [[1, 0]], "output": [[0, 1]]},
+                    {"input": [[4, 0]], "output": [[0, 4]]},
+                ],
+                test=[{"input": [[2, 0]], "output": [[0, 2]]}],
+                task_id="hidden-task",
+            ),
+        )
+        return server, request
+
+    async def test_verify_eval_grid_resolves_demo_grids(self) -> None:
+        server, request = await self._seeded("hidden-demo")
+        result = await server.verify_eval_grid(
+            request,
+            EvalGridVerificationRequest(response=_text_response("<answer>\n0 1\n</answer>"), grid_id="train_0"),
+        )
+        assert result.format_valid and result.exact
+        assert server._sessions["hidden-demo"].eval_results["train_0"][0]["grid_match"] == 1.0
+        # Hidden test targets never leave the session.
+        assert server._sessions["hidden-demo"].test_targets == {"test_0": [[0, 2]]}
+
+    async def test_verify_eval_grid_demo_miss_renders_behavioral_evidence(self) -> None:
+        server, request = await self._seeded("hidden-demo-miss")
+        result = await server.verify_eval_grid(
+            request,
+            EvalGridVerificationRequest(response=_text_response("<answer>\n1 1\n</answer>"), grid_id="train_1"),
+        )
+        assert result.format_valid and not result.exact
+        assert result.revision_feedback is not None
+        assert "Input:\n4 0" in result.revision_feedback
+        assert "Expected output:\n0 4" in result.revision_feedback
+
+    async def test_finalize_scores_the_final_test_answer(self) -> None:
+        server, request = await self._seeded("hidden-final")
+        for grid_id, answer in (("train_0", "0 1"), ("train_1", "0 4"), ("test_0", "0 2")):
+            await server.verify_eval_grid(
+                request,
+                EvalGridVerificationRequest(
+                    response=_text_response(f"<answer>\n{answer}\n</answer>"), grid_id=grid_id
+                ),
+            )
+        result = await server.finalize(request, _finalize_request(protocol="hidden_test", rounds=1))
+        assert result.grid_match == 1.0
+        assert result.cell_match == 1.0
+        assert result.test_exact
+        assert result.train_gate_pass
+        assert result.train_exact_fraction == 1.0
+        exact_reward = 1.0 + 0.20 + 0.10 + 0.05 + 0.05
+        assert result.reward == pytest.approx(exact_reward)
+
+    async def test_finalize_uses_the_last_test_attempt(self) -> None:
+        """A format retry replaces the failed first attempt on the same grid."""
+        server, request = await self._seeded("hidden-retry")
+        for text in ("no grid here", "<answer>\n0 2\n</answer>"):
+            await server.verify_eval_grid(
+                request, EvalGridVerificationRequest(response=_text_response(text), grid_id="test_0")
+            )
+        result = await server.finalize(request, _finalize_request(protocol="hidden_test"))
+        assert result.grid_match == 1.0
+        assert result.format_valid == 1.0
+
+    async def test_finalize_floors_unanswered_test_grids(self) -> None:
+        server, request = await self._seeded("hidden-unanswered")
+        await server.verify_eval_grid(
+            request,
+            EvalGridVerificationRequest(response=_text_response("<answer>\n0 1\n</answer>"), grid_id="train_0"),
+        )
+        result = await server.finalize(
+            request, _finalize_request(protocol="hidden_test", loss_masked=True)
+        )
+        assert result.grid_match == 0.0
+        assert result.cell_match == 0.0
+        assert not result.test_exact
+        assert not result.train_gate_pass  # train_1 never solved
+        assert result.train_exact_fraction == 0.5
+        assert result.reward == pytest.approx(-(0.20 + 0.10 + 0.05 + 0.05))
         assert result.instance_config == {"mask_sample": True}
 
 

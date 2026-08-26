@@ -128,9 +128,15 @@ class ArcTransformRunRequest(BaseRunRequest):
     # Per-row protocol override, so one agent instance can train on
     # eval_sequence episodes and validate on hidden_test episodes.
     protocol: Literal["hidden_test", "eval_sequence"] | None = None
+    # Per-row context-budget override: validation loop rows may use the full
+    # inference-engine window, while training rows stay at the config default
+    # sized to the trainable pack.
+    model_context_limit: int | None = None
 
     @model_validator(mode="after")
     def validate_task(self) -> ArcTransformRunRequest:
+        if self.model_context_limit is not None and self.model_context_limit <= 0:
+            raise ValueError("model_context_limit override must be positive")
         if not self.train:
             raise ValueError("ARC task must contain at least one training pair")
         if self.test:
@@ -294,6 +300,14 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             response.set_cookie(key, value)
         return parsed
 
+    def _context_budget(self, body: ArcTransformRunRequest) -> ContextBudget:
+        """Build the proposer context budget, honoring a per-row limit override."""
+        return ContextBudget(
+            model_context_limit=body.model_context_limit or self.config.model_context_limit,
+            reserved_proposer_output_tokens=self.config.reserved_proposer_output_tokens,
+            chat_template_margin=self.config.chat_template_margin,
+        )
+
     def _params(
         self,
         body: ArcTransformRunRequest,
@@ -409,11 +423,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         proposer_history: list[dict[str, Any]] = [
             _message(build_nvarc_proposer_prompt(demo_pairs=body.public_train_pairs()))
         ]
-        budget = ContextBudget(
-            model_context_limit=self.config.model_context_limit,
-            reserved_proposer_output_tokens=self.config.reserved_proposer_output_tokens,
-            chat_template_margin=self.config.chat_template_margin,
-        )
+        budget = self._context_budget(body)
         state = EpisodeState.initial()
         rounds: list[RoundTrace] = []
         demo_index = 0
@@ -637,11 +647,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         proposer_history: list[dict[str, Any]] = [
             _message(build_nvarc_proposer_prompt(demo_pairs=body.public_train_pairs()))
         ]
-        budget = ContextBudget(
-            model_context_limit=self.config.model_context_limit,
-            reserved_proposer_output_tokens=self.config.reserved_proposer_output_tokens,
-            chat_template_margin=self.config.chat_template_margin,
-        )
+        budget = self._context_budget(body)
         state = EpisodeState.initial()
         rounds: list[RoundTrace] = []
         grid_index = 0

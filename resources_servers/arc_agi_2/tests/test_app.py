@@ -95,12 +95,19 @@ def _text_response(text: str) -> NeMoGymResponse:
     )
 
 
-def _finalize_request(*, protocol: str, loss_masked: bool = False, rounds: int = 1) -> ARCAGIFinalizeRequest:
+def _finalize_request(
+    *,
+    protocol: str,
+    loss_masked: bool = False,
+    proposer_format_failure: bool = False,
+    rounds: int = 1,
+) -> ARCAGIFinalizeRequest:
     return ARCAGIFinalizeRequest(
         responses_create_params={"input": []},
         response=_text_response("<rules_summary>r</rules_summary>").model_dump(),
         termination_reason="all_solved",
         loss_masked=loss_masked,
+        proposer_format_failure=proposer_format_failure,
         protocol=protocol,
         trace={"rounds": [{}] * rounds},
     )
@@ -196,6 +203,29 @@ class TestEvalSequence:
         assert result.loss_masked
         assert result.instance_config == {"mask_sample": True}
 
+    async def test_finalize_floors_proposer_format_failures_with_loss_on(self) -> None:
+        # Even a sequence with solved grids is pinned to the floor when the
+        # trained final turn was an unparseable/runaway rule; the sample
+        # stays in loss so runaway thinking receives negative gradient.
+        server, request = await self._seeded("eval-floor")
+        for grid_id, answer in (("test_0", "0 2"), ("test_1", "0 3")):
+            await server.verify_eval_grid(
+                request,
+                EvalGridVerificationRequest(
+                    response=_text_response(f"<answer>\n{answer}\n</answer>"), grid_id=grid_id
+                ),
+            )
+        result = await server.finalize(
+            request,
+            _finalize_request(protocol="eval_sequence", proposer_format_failure=True),
+        )
+        assert result.proposer_format_failure
+        assert not result.loss_masked
+        assert result.instance_config == {"mask_sample": False}
+        assert result.reward == pytest.approx(-(0.20 + 0.10 + 0.05 + 0.05))
+        # Metrics still report what actually happened on the grids.
+        assert result.eval_exact_fraction == 1.0
+
 
 class TestHiddenTest:
     """The real-ARC protocol: demo grids verified during refinement, hidden
@@ -285,6 +315,26 @@ class TestHiddenTest:
         assert result.train_exact_fraction == 0.5
         assert result.reward == pytest.approx(-(0.20 + 0.10 + 0.05 + 0.05))
         assert result.instance_config == {"mask_sample": True}
+
+    async def test_finalize_floors_proposer_format_failures_with_loss_on(self) -> None:
+        # A fallback rule may still have answered the hidden test exactly,
+        # but the trained final turn was unparseable: reward floored, loss
+        # ON, and the metrics keep reporting the real answers.
+        server, request = await self._seeded("hidden-floor")
+        await server.verify_eval_grid(
+            request,
+            EvalGridVerificationRequest(response=_text_response("<answer>\n0 2\n</answer>"), grid_id="test_0"),
+        )
+        result = await server.finalize(
+            request,
+            _finalize_request(protocol="hidden_test", proposer_format_failure=True),
+        )
+        assert result.proposer_format_failure
+        assert not result.loss_masked
+        assert result.instance_config == {"mask_sample": False}
+        assert result.reward == pytest.approx(-(0.20 + 0.10 + 0.05 + 0.05))
+        assert result.grid_match == 1.0
+        assert result.cell_match == 1.0
 
 
 class TestSingleTurnVerify:

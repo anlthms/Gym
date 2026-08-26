@@ -367,6 +367,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         rounds: list[RoundTrace],
         loss_masked: bool,
         protocol: str,
+        proposer_format_failure: bool = False,
     ) -> ArcTransformVerifyResponse:
         assert state.termination_reason is not None
         payload = {
@@ -374,12 +375,14 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             "response": last_proposer_response.model_dump(),
             "termination_reason": state.termination_reason.value,
             "loss_masked": loss_masked,
+            "proposer_format_failure": proposer_format_failure,
             "protocol": protocol,
             "trace": {
                 "task_id": body.task_id,
                 "rounds": [asdict(round_trace) for round_trace in rounds],
                 "termination_reason": state.termination_reason.value,
                 "loss_masked": loss_masked,
+                "proposer_format_failure": proposer_format_failure,
                 "policy_loss": {
                     "role": "proposer",
                     "round_index": rounds[-1].round_index,
@@ -430,7 +433,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         description: str | None = None
         last_proposer_response: NeMoGymResponse | None = None
         loop_end: TerminationReason | None = None
-        loss_masked = False
+        proposer_format_failure = False
 
         while loop_end is None:
             proposer_params = self._params(
@@ -462,7 +465,10 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             try:
                 description = parse_canonical_rule(_response_text(proposer_response))
             except TransformDescriptionParseError:
-                loss_masked = True
+                # Proposer-caused failure: reward floor with loss ON (the
+                # trained final turn IS the unparseable/runaway one), never
+                # masked -- masking is reserved for executor-caused failures.
+                proposer_format_failure = True
                 if description is None:
                     state = state.terminate(TerminationReason.AGENT_ERROR)
                     return await self._finalize(
@@ -471,8 +477,9 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                         last_proposer_response=last_proposer_response,
                         state=state,
                         rounds=rounds,
-                        loss_masked=True,
+                        loss_masked=False,
                         protocol="hidden_test",
+                        proposer_format_failure=True,
                     )
                 # A prior valid rule exists: still answer the hidden test.
                 loop_end = TerminationReason.AGENT_ERROR
@@ -565,8 +572,9 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             last_proposer_response=last_proposer_response,
             state=state,
             rounds=rounds,
-            loss_masked=loss_masked,
+            loss_masked=False,
             protocol="hidden_test",
+            proposer_format_failure=proposer_format_failure,
         )
 
     async def _run_single_eval_executor(
@@ -681,6 +689,8 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
             try:
                 description = parse_canonical_rule(_response_text(proposer_response))
             except TransformDescriptionParseError:
+                # Proposer-caused failure: reward floor with loss ON, so
+                # runaway thinking finally receives negative gradient.
                 state = state.terminate(TerminationReason.AGENT_ERROR)
                 return await self._finalize(
                     body=body,
@@ -688,8 +698,9 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                     last_proposer_response=proposer_response,
                     state=state,
                     rounds=rounds,
-                    loss_masked=True,
+                    loss_masked=False,
                     protocol="eval_sequence",
+                    proposer_format_failure=True,
                 )
             round_trace.transform_description = description
             state = state.description_generated()

@@ -363,6 +363,33 @@ async def test_hidden_test_budget_exhaustion_still_answers_the_test() -> None:
     assert verify_ids == ["train_0", "test_0"]
 
 
+async def test_row_context_limit_override_unthrottles_the_budget() -> None:
+    """A per-row model_context_limit lifts the config budget for that episode."""
+    evidence = "EVIDENCE train_0: expected differs, with enough bytes to overflow the tiny budget"
+    agent = _hidden_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n1 0\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response(REVISED_RULE, prompt_tokens=200, generation_tokens=20),
+            _response("<answer>\n0 1\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [_demo_miss(evidence), _exact("train_0"), _exact("test_0")],
+        model_context_limit=300,  # exhausts after the first miss without the override
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+    body = _hidden_body().model_copy(update={"model_context_limit": 2048})
+
+    result = await agent.run(request, body)
+
+    # The row-level limit permitted the revision the config limit would deny.
+    assert result.termination_reason == "train_verified"
+    assert not result.loss_masked
+    roles = [name for name, _ in agent.model_requests]
+    assert roles == ["proposer", "executor", "proposer", "executor", "executor"]
+
+
 async def test_hidden_test_masks_double_executor_format_failure_without_answering() -> None:
     failure = {
         "grid_id": "train_0",

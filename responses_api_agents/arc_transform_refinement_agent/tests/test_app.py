@@ -101,6 +101,7 @@ class MockEvalAgent(ArcTransformRefinementAgent):
                 "reward": 0.0,
                 "termination_reason": payload["termination_reason"],
                 "loss_masked": payload["loss_masked"],
+                "proposer_format_failure": payload["proposer_format_failure"],
                 "protocol": payload["protocol"],
                 "trace": payload["trace"],
             }
@@ -233,7 +234,7 @@ async def test_eval_sequence_masks_double_executor_format_failure() -> None:
     assert "Do not change or reinterpret the transformation" in retry_input[-1]["content"]
 
 
-async def test_eval_sequence_masks_non_canonical_proposer_output() -> None:
+async def test_eval_sequence_floors_non_canonical_proposer_output_with_loss_on() -> None:
     agent = _eval_agent(
         [
             _response(
@@ -247,8 +248,10 @@ async def test_eval_sequence_masks_non_canonical_proposer_output() -> None:
 
     result = await agent.run(request, _eval_body())
 
+    # Proposer-caused failure: reward floor with loss ON, never masked.
     assert result.termination_reason == "agent_error"
-    assert result.loss_masked
+    assert not result.loss_masked
+    assert result.proposer_format_failure
     assert len(agent.model_requests) == 1
 
 
@@ -418,7 +421,7 @@ async def test_hidden_test_masks_double_executor_format_failure_without_answerin
     assert verify_ids == ["train_0", "train_0"]  # the hidden test was never reached
 
 
-async def test_hidden_test_unparseable_first_rule_is_agent_error() -> None:
+async def test_hidden_test_unparseable_first_rule_is_floored_with_loss_on() -> None:
     agent = _hidden_agent(
         [_response("not a rule", prompt_tokens=90, generation_tokens=8)],
         [],
@@ -429,7 +432,8 @@ async def test_hidden_test_unparseable_first_rule_is_agent_error() -> None:
     result = await agent.run(request, _hidden_body())
 
     assert result.termination_reason == "agent_error"
-    assert result.loss_masked
+    assert not result.loss_masked
+    assert result.proposer_format_failure
     assert len(agent.model_requests) == 1
 
 
@@ -449,8 +453,10 @@ async def test_hidden_test_parse_failure_falls_back_to_the_prior_rule() -> None:
 
     result = await agent.run(request, _hidden_body())
 
+    # The trained final turn is the unparseable rule: floored, loss ON.
     assert result.termination_reason == "agent_error"
-    assert result.loss_masked
+    assert not result.loss_masked
+    assert result.proposer_format_failure
     # The hidden test was still answered, using the first (valid) rule.
     final_call = agent.model_requests[-1][1]["input"][0]["content"]
     assert "3 0" in final_call

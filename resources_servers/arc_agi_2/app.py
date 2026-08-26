@@ -213,6 +213,10 @@ class ARCAGIFinalizeRequest(BaseVerifyRequest):
 
     termination_reason: str
     loss_masked: bool
+    # Proposer-caused format failure (unparseable rule, runaway think): the
+    # episode reward is pinned to the floor with loss ON, so the trained
+    # final turn receives negative gradient instead of being masked.
+    proposer_format_failure: bool = False
     protocol: str = "hidden_test"
     trace: dict[str, Any]
 
@@ -230,6 +234,9 @@ class ARCAGIVerifyResponse(BaseVerifyResponse):
     task_id: str | None = None
     termination_reason: str | None = None
     loss_masked: bool = False
+    # Surfaced as a per-agent scalar so validation tracks the proposer's
+    # format-failure rate directly (floored reward, loss ON).
+    proposer_format_failure: bool = False
     # NeMo-RL reads instance_config.mask_sample to zero the episode's loss
     # multiplier (the sample still counts toward the group baseline).
     instance_config: dict[str, Any] = Field(default_factory=lambda: {"mask_sample": False})
@@ -430,12 +437,19 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             for grid_id in session.train_targets
         ]
         grid_match = sum(per_grid_exact) / count if count else 0.0
+        reward = sum(per_grid_rewards) / count if count else floor
+        if body.proposer_format_failure:
+            # The trained turn is the unparseable/runaway rule: floor it.
+            reward = floor
         return ARCAGIVerifyResponse(
-            **body.model_dump(exclude={"termination_reason", "loss_masked", "protocol", "trace"}),
-            reward=sum(per_grid_rewards) / count if count else floor,
+            **body.model_dump(
+                exclude={"termination_reason", "loss_masked", "proposer_format_failure", "protocol", "trace"}
+            ),
+            reward=reward,
             task_id=session.task_id,
             termination_reason=body.termination_reason,
             loss_masked=body.loss_masked,
+            proposer_format_failure=body.proposer_format_failure,
             instance_config={"mask_sample": body.loss_masked},
             train_gate_pass=bool(demo_solved) and all(demo_solved),
             test_exact=count > 0 and grid_match == 1.0,
@@ -475,12 +489,19 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
         reward = sum(per_grid_rewards) / count if count else floor
         if all_solved:
             reward += self.config.all_solved_bonus
+        if body.proposer_format_failure:
+            # The trained turn is the unparseable/runaway rule: floor it,
+            # bonus and per-grid gains included.
+            reward = floor
         return ARCAGIVerifyResponse(
-            **body.model_dump(exclude={"termination_reason", "loss_masked", "protocol", "trace"}),
+            **body.model_dump(
+                exclude={"termination_reason", "loss_masked", "proposer_format_failure", "protocol", "trace"}
+            ),
             reward=reward,
             task_id=session.task_id,
             termination_reason=body.termination_reason,
             loss_masked=body.loss_masked,
+            proposer_format_failure=body.proposer_format_failure,
             instance_config={"mask_sample": body.loss_masked},
             eval_exact_fraction=solved / count if count else 0.0,
             eval_cell_match=sum(per_grid_cell) / count if count else 0.0,

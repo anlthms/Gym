@@ -138,15 +138,18 @@ def _eval_body() -> ArcTransformRunRequest:
     )
 
 
-async def test_eval_sequence_advances_on_solve_and_revises_on_fail() -> None:
+async def test_eval_sequence_advances_on_solve_and_sweeps_with_the_final_rule() -> None:
     evidence = "EVIDENCE test_1: expected differs"
     agent = _eval_agent(
         [
             _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
             _response("<answer>\n0 2\n</answer>", prompt_tokens=60, generation_tokens=6),
             _response("<answer>\n3 3\n</answer>", prompt_tokens=60, generation_tokens=6),
-            _response(CANONICAL_RULE, prompt_tokens=160, generation_tokens=20),
+            _response(REVISED_RULE, prompt_tokens=160, generation_tokens=20),
             _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+            # Final sweep: test_0 was last attempted with the FIRST rule, so
+            # the final rule answers it once more before finalize.
+            _response("<answer>\n0 2\n</answer>", prompt_tokens=60, generation_tokens=6),
         ],
         [
             {"grid_id": "test_0", "format_valid": True, "exact": True, "feedback": "exact", "revision_feedback": None},
@@ -158,6 +161,7 @@ async def test_eval_sequence_advances_on_solve_and_revises_on_fail() -> None:
                 "revision_feedback": evidence,
             },
             {"grid_id": "test_1", "format_valid": True, "exact": True, "feedback": "exact", "revision_feedback": None},
+            {"grid_id": "test_0", "format_valid": True, "exact": True, "feedback": "exact", "revision_feedback": None},
         ],
     )
     request = MagicMock(spec=Request)
@@ -168,19 +172,22 @@ async def test_eval_sequence_advances_on_solve_and_revises_on_fail() -> None:
     assert result.termination_reason == "all_solved"
     assert not result.loss_masked
     roles = [name for name, _ in agent.model_requests]
-    assert roles == ["proposer", "executor", "executor", "proposer", "executor"]
+    assert roles == ["proposer", "executor", "executor", "proposer", "executor", "executor"]
 
     # Executor calls: fresh single-grid sessions, one user message, no
     # instructions (byte-parity with native executor training rows).
-    for index in (1, 2, 4):
+    for index in (1, 2, 4, 5):
         _, params = agent.model_requests[index]
         assert "instructions" not in params
         assert len(params["input"]) == 1
         assert "<transformation>" in params["input"][0]["content"]
-        assert "Reverse each row." in params["input"][0]["content"]
     # The rule is applied to exactly one grid per call.
     assert "2 0" in agent.model_requests[1][1]["input"][0]["content"]
     assert "3 0" not in agent.model_requests[1][1]["input"][0]["content"]
+    # The sweep call re-answers test_0 with the FINAL (revised) rule.
+    sweep_call = agent.model_requests[5][1]["input"][0]["content"]
+    assert "2 0" in sweep_call
+    assert "recolor" in sweep_call
 
     # The revision proposer turn carries the server-rendered evidence.
     second_proposer_input = json.dumps(agent.model_requests[3][1]["input"])
@@ -191,9 +198,48 @@ async def test_eval_sequence_advances_on_solve_and_revises_on_fail() -> None:
     assert "[[0, 2]]" not in all_model_requests
     assert "0 2" not in json.dumps(agent.model_requests[0][1])  # not in the initial prompt
 
+    # Every grid's last verification used the final rule.
+    verify_ids = [payload["grid_id"] for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert verify_ids == ["test_0", "test_1", "test_1", "test_0"]
+
     finalize_payload = agent.resource_requests[-1][1]
     assert finalize_payload["protocol"] == "eval_sequence"
-    assert finalize_payload["response"]["output"][0]["content"][0]["text"] == CANONICAL_RULE
+    assert finalize_payload["response"]["output"][0]["content"][0]["text"] == REVISED_RULE
+
+
+async def test_eval_sequence_budget_exhaustion_sweeps_unreached_grids() -> None:
+    evidence = "EVIDENCE test_0: expected differs, with enough bytes to overflow the tiny budget"
+    agent = _eval_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n2 2\n</answer>", prompt_tokens=60, generation_tokens=6),
+            # Final sweep reaches test_1 even though the sequence never did;
+            # test_0 is skipped (already last-attempted with the final rule).
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [
+            {
+                "grid_id": "test_0",
+                "format_valid": True,
+                "exact": False,
+                "feedback": "mismatch",
+                "revision_feedback": evidence,
+            },
+            {"grid_id": "test_1", "format_valid": True, "exact": True, "feedback": "exact", "revision_feedback": None},
+        ],
+        config=_config(protocol="eval_sequence", model_context_limit=300),
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _eval_body())
+
+    assert result.termination_reason == "context_exhausted"
+    assert not result.loss_masked
+    roles = [name for name, _ in agent.model_requests]
+    assert roles == ["proposer", "executor", "executor"]
+    verify_ids = [payload["grid_id"] for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert verify_ids == ["test_0", "test_1"]
 
 
 async def test_eval_sequence_masks_double_executor_format_failure() -> None:

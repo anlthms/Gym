@@ -197,6 +197,24 @@ class TestEvalSequence:
         exact_reward = 1.0 + 0.20 + 0.10 + 0.05 + 0.05
         assert result.reward == pytest.approx(exact_reward + 0.5)
 
+    async def test_finalize_scores_each_grid_on_its_last_attempt(self) -> None:
+        # Final-rule credit: an exact solve by an EARLIER rule does not pay
+        # if the final rule's sweep attempt on the same grid misses -- the
+        # trained final turn is scored on what its own rule achieves.
+        server, request = await self._seeded("eval-last-attempt")
+        for grid_id, answer in (("test_0", "0 2"), ("test_1", "0 3"), ("test_0", "9 9")):
+            await server.verify_eval_grid(
+                request,
+                EvalGridVerificationRequest(
+                    response=_text_response(f"<answer>\n{answer}\n</answer>"), grid_id=grid_id
+                ),
+            )
+        result = await server.finalize(request, _finalize_request(protocol="eval_sequence"))
+        assert result.eval_exact_fraction == 0.5  # test_0's LAST attempt missed
+        assert not result.all_solved
+        exact_reward = 1.0 + 0.20 + 0.10 + 0.05 + 0.05
+        assert result.reward < (exact_reward + exact_reward) / 2  # no best-attempt inheritance
+
     async def test_finalize_masks_flagged_episodes(self) -> None:
         server, request = await self._seeded("eval-mask")
         result = await server.finalize(request, _finalize_request(protocol="eval_sequence", loss_masked=True))

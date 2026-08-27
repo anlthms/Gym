@@ -464,12 +464,15 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
     def _finalize_eval_sequence(self, session: ARCSessionState, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:
         """Aggregate the evaluation-grid sequence into one episode reward.
 
-        Each grid contributes its best attempt's gain-over-echo grid score;
-        a grid the episode never reached sits at the reward floor, so ending
-        early is never better than attempting the remaining grids. A rule
-        that generalizes across several grids therefore outscores one that
-        happens to solve a single grid, and solving everything earns the
-        configured bonus on top.
+        Each grid is scored on its LAST recorded attempt: the agent sweeps
+        every grid with the final rule before finalizing, so the last attempt
+        reflects what the trained (final) proposer turn actually achieves.
+        Scoring best attempts instead would let a degraded final revision
+        inherit rewards earned by earlier rules under advance-on-solve. A
+        grid with no attempt sits at the reward floor (defensive: the sweep
+        should leave none), so ending early is never better than attempting
+        the remaining grids, and solving everything with the final rule
+        earns the configured bonus on top.
         """
         floor = reward_floor(self.config.reward_weights())
         per_grid_rewards: list[float] = []
@@ -478,9 +481,10 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
         for grid_id in session.test_targets:
             attempts = session.eval_results.get(grid_id, [])
             if attempts:
-                per_grid_rewards.append(max(attempt["reward"] for attempt in attempts))
-                per_grid_cell.append(max(attempt["cell_match"] for attempt in attempts))
-                solved += int(any(attempt["grid_match"] for attempt in attempts))
+                final = attempts[-1]
+                per_grid_rewards.append(final["reward"])
+                per_grid_cell.append(final["cell_match"])
+                solved += int(final["grid_match"])
             else:
                 per_grid_rewards.append(floor)
                 per_grid_cell.append(0.0)

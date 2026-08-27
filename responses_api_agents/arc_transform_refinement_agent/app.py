@@ -639,7 +639,16 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         held-out evaluation grids in order. An exact solve advances to the
         next grid with the same rule; a miss returns the server-rendered
         behavioral evidence (input, prediction, expected, diff) for a
-        revision. Reward is aggregated server-side over the grid sequence.
+        revision.
+
+        Final-rule credit: only the FINAL proposer turn is trained, so before
+        finalizing, the current rule is re-applied once to every grid whose
+        recorded last attempt used an older rule (including grids the
+        sequence never reached), and the server scores each grid's LAST
+        attempt. Without this sweep, a degraded final revision inherits
+        best-attempt rewards that earlier rules earned under advance-on-solve
+        -- credit misassignment that can reinforce revision churn (measured
+        as the declining loop metric of the first two co-training runs).
         """
         seed_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
@@ -659,8 +668,14 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
         state = EpisodeState.initial()
         rounds: list[RoundTrace] = []
         grid_index = 0
+        description: str | None = None
+        # Grids whose recorded last attempt used the current rule; reset on
+        # every accepted revision so the final sweep re-attempts the rest.
+        attempted_with_current_rule: set[str] = set()
+        loop_end: TerminationReason | None = None
+        proposer_response: NeMoGymResponse | None = None
 
-        while True:
+        while loop_end is None:
             proposer_params = self._params(
                 body,
                 input_items=proposer_history,
@@ -704,6 +719,7 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                 )
             round_trace.transform_description = description
             state = state.description_generated()
+            attempted_with_current_rule = set()
 
             failed_verification: dict[str, Any] | None = None
             while grid_index < len(eval_ids):
@@ -728,21 +744,19 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                         loss_masked=True,
                         protocol="eval_sequence",
                     )
+                attempted_with_current_rule.add(grid_id)
                 if verification["exact"]:
                     grid_index += 1
-                    state = state.eval_grid_solved(all_solved=grid_index == len(eval_ids))
-                    if state.phase is EpisodePhase.TERMINATED:
-                        return await self._finalize(
-                            body=body,
-                            cookies=resource_cookies,
-                            last_proposer_response=proposer_response,
-                            state=state,
-                            rounds=rounds,
-                            loss_masked=False,
-                            protocol="eval_sequence",
-                        )
+                    if grid_index == len(eval_ids):
+                        loop_end = TerminationReason.ALL_SOLVED
+                        # Enter the final-answer phase for the sweep.
+                        state = state.demos_verified()
+                        break
+                    state = state.eval_grid_solved(all_solved=False)
                     continue
                 failed_verification = verification
+                break
+            if loop_end is not None:
                 break
 
             assert failed_verification is not None  # a revision follows only a miss
@@ -754,29 +768,53 @@ class ArcTransformRefinementAgent(SimpleResponsesAPIAgent):
                 current_proposer_tokens=current_tokens,
                 next_feedback_tokens=conservative_text_token_bound(feedback),
             ):
-                state = state.terminate(TerminationReason.CONTEXT_EXHAUSTED)
-                return await self._finalize(
-                    body=body,
-                    cookies=resource_cookies,
-                    last_proposer_response=proposer_response,
-                    state=state,
-                    rounds=rounds,
-                    loss_masked=False,
-                    protocol="eval_sequence",
-                )
+                loop_end = TerminationReason.CONTEXT_EXHAUSTED
+                state = state.demo_loop_exhausted()
+                break
             if state.round_index >= self.config.max_rounds:
-                state = state.terminate(TerminationReason.EMERGENCY_ROUND_CAP)
-                return await self._finalize(
-                    body=body,
-                    cookies=resource_cookies,
-                    last_proposer_response=proposer_response,
-                    state=state,
-                    rounds=rounds,
-                    loss_masked=False,
-                    protocol="eval_sequence",
-                )
+                loop_end = TerminationReason.EMERGENCY_ROUND_CAP
+                state = state.demo_loop_exhausted()
+                break
             proposer_history.extend(item.model_dump() for item in proposer_response.output)
             proposer_history.append(_message(feedback))
+
+        # Final sweep: the trained turn is scored on what ITS rule does, so
+        # every grid last attempted with an older rule (or never reached) is
+        # answered once more with the final rule before finalizing.
+        assert description is not None and proposer_response is not None
+        for grid_id in eval_ids:
+            if grid_id in attempted_with_current_rule:
+                continue
+            verification, state, resource_cookies = await self._run_single_eval_executor(
+                request=request,
+                body=body,
+                description=description,
+                grid_id=grid_id,
+                input_grid=eval_inputs[grid_id],
+                state=state,
+                round_trace=rounds[-1],
+                resource_cookies=resource_cookies,
+            )
+            if verification is None:
+                return await self._finalize(
+                    body=body,
+                    cookies=resource_cookies,
+                    last_proposer_response=proposer_response,
+                    state=state,
+                    rounds=rounds,
+                    loss_masked=True,
+                    protocol="eval_sequence",
+                )
+        state = state.terminate(loop_end)
+        return await self._finalize(
+            body=body,
+            cookies=resource_cookies,
+            last_proposer_response=proposer_response,
+            state=state,
+            rounds=rounds,
+            loss_masked=False,
+            protocol="eval_sequence",
+        )
 
 
 if __name__ == "__main__":

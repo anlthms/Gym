@@ -94,6 +94,8 @@ class MockEvalAgent(ArcTransformRefinementAgent):
         self.resource_requests.append((url_path, payload))
         if url_path == "/verify_eval_grid":
             return self.eval_results.pop(0), cookies
+        if url_path == "/select_candidate":
+            return self.selection_response, cookies
         if url_path == "/finalize":
             response = {
                 "responses_create_params": payload["responses_create_params"],
@@ -114,6 +116,7 @@ def _eval_agent(
     eval_results,
     *,
     config: ArcTransformRefinementAgentConfig | None = None,
+    selection_response: dict | None = None,
 ) -> MockEvalAgent:
     agent = MockEvalAgent(
         config=config or _config(protocol="eval_sequence"),
@@ -123,6 +126,7 @@ def _eval_agent(
     agent.set_model_responses(model_responses)
     object.__setattr__(agent, "eval_results", list(eval_results))
     object.__setattr__(agent, "resource_requests", [])
+    object.__setattr__(agent, "selection_response", selection_response)
     return agent
 
 
@@ -507,6 +511,223 @@ async def test_hidden_test_parse_failure_falls_back_to_the_prior_rule() -> None:
     final_call = agent.model_requests[-1][1]["input"][0]["content"]
     assert "3 0" in final_call
     assert "Reverse each row." in final_call
+
+
+async def test_hidden_test_sweeps_regressed_demos_with_the_final_rule() -> None:
+    """A revision must re-answer earlier demos before touching the test."""
+    evidence = "EVIDENCE train_1: expected differs"
+    agent = _eval_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n0 1\n</answer>", prompt_tokens=60, generation_tokens=6),  # train_0 exact
+            _response("<answer>\n4 4\n</answer>", prompt_tokens=60, generation_tokens=6),  # train_1 miss
+            _response(REVISED_RULE, prompt_tokens=160, generation_tokens=20),
+            _response("<answer>\n0 4\n</answer>", prompt_tokens=60, generation_tokens=6),  # train_1 exact
+            # Sweep: train_0 was last answered by the FIRST rule.
+            _response("<answer>\n0 1\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),  # test
+        ],
+        [
+            _exact("train_0"),
+            {
+                "grid_id": "train_1",
+                "format_valid": True,
+                "exact": False,
+                "feedback": "mismatch",
+                "revision_feedback": evidence,
+            },
+            _exact("train_1"),
+            _exact("train_0"),
+            _exact("test_0"),
+        ],
+        config=_config(),
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+    body = ArcTransformRunRequest(
+        responses_create_params={"input": [], "temperature": 0.0},
+        train=[
+            {"input": [[1, 0]], "output": [[0, 1]]},
+            {"input": [[4, 0]], "output": [[0, 4]]},
+        ],
+        test=[{"input": [[3, 0]], "output": [[0, 3]]}],
+        task_id="sweep-task",
+    )
+
+    result = await agent.run(request, body)
+
+    assert result.termination_reason == "train_verified"
+    verifications = [payload for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert [payload["grid_id"] for payload in verifications] == [
+        "train_0",
+        "train_1",
+        "train_1",
+        "train_0",  # the sweep, with the final rule
+        "test_0",
+    ]
+    # The sweep call carries the REVISED rule.
+    sweep_call = agent.model_requests[5][1]["input"][0]["content"]
+    assert "1 0" in sweep_call and "recolor" in sweep_call
+    # Demo-loop verifications may request revision evidence; the sweep and the
+    # hidden-test answer must not (their evidence would leak into the trace).
+    assert [payload["include_revision_feedback"] for payload in verifications] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+    ]
+
+
+CANDIDATE_RULE_B = (
+    "<rules_summary>Swap the two cells.</rules_summary>\n"
+    "<solution_steps>Exchange cell 0 and cell 1 of the row.</solution_steps>\n"
+    "<key_insight>A pure position swap.</key_insight>\n"
+    "<puzzle_concepts>swap</puzzle_concepts>"
+)
+
+
+def _candidate_body(**overrides) -> ArcTransformRunRequest:
+    fields = {
+        "responses_create_params": {"input": [], "temperature": 1.0},
+        "train": [{"input": [[1, 0]], "output": [[0, 1]]}],
+        "test": [{"input": [[3, 0]], "output": [[0, 3]]}],
+        "task_id": "candidate-task",
+        "protocol": "candidate_select",
+        "num_candidates": 2,
+    }
+    fields.update(overrides)
+    return ArcTransformRunRequest(**fields)
+
+
+async def test_candidate_select_scores_all_demos_then_touches_the_test_once() -> None:
+    agent = _eval_agent(
+        [
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response(CANDIDATE_RULE_B, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n1 1\n</answer>", prompt_tokens=60, generation_tokens=6),  # cand_000 demo
+            _response("<answer>\n0 1\n</answer>", prompt_tokens=60, generation_tokens=6),  # cand_001 demo
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),  # test, selected only
+        ],
+        [
+            {
+                "grid_id": "train_0",
+                "format_valid": True,
+                "exact": False,
+                "feedback": "mismatch",
+                "revision_feedback": None,
+            },
+            _exact("train_0"),
+            _exact("test_0"),
+        ],
+        config=_config(),
+        selection_response={
+            "selected_candidate_id": "cand_001",
+            "scores": {
+                "cand_000": {
+                    "demo_exact_count": 0.0,
+                    "demo_mean_cell_match": 0.0,
+                    "demo_mean_format_valid": 1.0,
+                    "demo_grids": 1.0,
+                },
+                "cand_001": {
+                    "demo_exact_count": 1.0,
+                    "demo_mean_cell_match": 1.0,
+                    "demo_mean_format_valid": 1.0,
+                    "demo_grids": 1.0,
+                },
+            },
+        },
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _candidate_body())
+
+    assert result.termination_reason == "candidate_selected"
+    assert not result.loss_masked
+    roles = [name for name, _ in agent.model_requests]
+    assert roles == ["proposer", "proposer", "executor", "executor", "executor"]
+    # Both proposer samples see the same demo-only prompt.
+    assert agent.model_requests[0][1]["input"] == agent.model_requests[1][1]["input"]
+    # Demo scoring is namespaced per candidate; the single test touch is not.
+    verifications = [payload for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert [(payload["grid_id"], payload.get("candidate_id")) for payload in verifications] == [
+        ("train_0", "cand_000"),
+        ("train_0", "cand_001"),
+        ("test_0", None),
+    ]
+    assert all(payload["include_revision_feedback"] is False for payload in verifications)
+    # The test grid was answered exactly once, with the SELECTED rule.
+    test_call = agent.model_requests[4][1]["input"][0]["content"]
+    assert "3 0" in test_call and "Swap the two cells." in test_call
+
+    finalize_payload = agent.resource_requests[-1][1]
+    assert finalize_payload["protocol"] == "candidate_select"
+    assert finalize_payload["selected_candidate_id"] == "cand_001"
+    selection_trace = finalize_payload["trace"]["candidate_selection"]
+    assert selection_trace["selected_candidate_id"] == "cand_001"
+    assert selection_trace["parseable_candidates"] == 2
+    # The trained/eval turn is the SELECTED candidate's response.
+    assert finalize_payload["response"]["output"][0]["content"][0]["text"] == CANDIDATE_RULE_B
+    assert finalize_payload["trace"]["policy_loss"]["round_index"] == 1
+    # No test target anywhere in model requests or the finalize payload
+    # (scores are task-level aggregates, and evidence prompts were suppressed).
+    assert "[[0, 3]]" not in json.dumps([payload for _, payload in agent.model_requests])
+    assert "0 3" not in json.dumps(finalize_payload["trace"]["candidate_selection"])
+
+
+async def test_candidate_select_skips_unparseable_candidates() -> None:
+    agent = _eval_agent(
+        [
+            _response("not a rule", prompt_tokens=100, generation_tokens=8),
+            _response(CANONICAL_RULE, prompt_tokens=100, generation_tokens=20),
+            _response("<answer>\n0 1\n</answer>", prompt_tokens=60, generation_tokens=6),
+            _response("<answer>\n0 3\n</answer>", prompt_tokens=60, generation_tokens=6),
+        ],
+        [_exact("train_0"), _exact("test_0")],
+        config=_config(),
+        selection_response={
+            "selected_candidate_id": "cand_001",
+            "scores": {
+                "cand_001": {
+                    "demo_exact_count": 1.0,
+                    "demo_mean_cell_match": 1.0,
+                    "demo_mean_format_valid": 1.0,
+                    "demo_grids": 1.0,
+                }
+            },
+        },
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _candidate_body())
+
+    assert result.termination_reason == "candidate_selected"
+    # Only the parseable candidate scored demos; its id keeps emission order.
+    verifications = [payload for path, payload in agent.resource_requests if path == "/verify_eval_grid"]
+    assert verifications[0]["candidate_id"] == "cand_001"
+
+
+async def test_candidate_select_with_no_parseable_candidate_is_floored_loss_on() -> None:
+    agent = _eval_agent(
+        [
+            _response("not a rule", prompt_tokens=100, generation_tokens=8),
+            _response("also not a rule", prompt_tokens=100, generation_tokens=8),
+        ],
+        [],
+        config=_config(),
+    )
+    request = MagicMock(spec=Request)
+    request.cookies = {}
+
+    result = await agent.run(request, _candidate_body())
+
+    assert result.termination_reason == "agent_error"
+    assert not result.loss_masked
+    assert result.proposer_format_failure
+    assert len(agent.model_requests) == 2  # no executor calls, test untouched
 
 
 async def test_row_protocol_overrides_the_config_default() -> None:

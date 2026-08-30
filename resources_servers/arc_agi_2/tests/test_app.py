@@ -323,9 +323,7 @@ class TestHiddenTest:
             request,
             EvalGridVerificationRequest(response=_text_response("<answer>\n0 1\n</answer>"), grid_id="train_0"),
         )
-        result = await server.finalize(
-            request, _finalize_request(protocol="hidden_test", loss_masked=True)
-        )
+        result = await server.finalize(request, _finalize_request(protocol="hidden_test", loss_masked=True))
         assert result.grid_match == 0.0
         assert result.cell_match == 0.0
         assert not result.test_exact
@@ -353,6 +351,211 @@ class TestHiddenTest:
         assert result.reward == pytest.approx(-(0.20 + 0.10 + 0.05 + 0.05))
         assert result.grid_match == 1.0
         assert result.cell_match == 1.0
+
+
+class TestHiddenTestFinalRuleGate:
+    """The demo gate must describe the FINAL rule, not any-attempt progress."""
+
+    async def _seeded(self, session_id: str) -> tuple[ARCAGIResourcesServer, Request]:
+        server = _server()
+        request = _request(session_id)
+        await server.seed_session(
+            request,
+            ARCAGIRunRequest(
+                responses_create_params={"input": []},
+                train=[
+                    {"input": [[1, 0]], "output": [[0, 1]]},
+                    {"input": [[4, 0]], "output": [[0, 4]]},
+                ],
+                test=[{"input": [[2, 0]], "output": [[0, 2]]}],
+                task_id="gate-task",
+            ),
+        )
+        return server, request
+
+    async def test_final_rule_regressing_an_earlier_demo_fails_the_gate(self) -> None:
+        # Rule 1 solved train_0; the revised (final) rule solves train_1 but
+        # its sweep attempt on train_0 misses. Every demo was solved at SOME
+        # point, but no single rule solved them all -- the gate must fail.
+        server, request = await self._seeded("gate-regress")
+        for grid_id, answer in (
+            ("train_0", "0 1"),  # rule 1: exact
+            ("train_1", "0 4"),  # final rule: exact
+            ("train_0", "9 9"),  # final rule sweep: regression
+            ("test_0", "0 2"),
+        ):
+            await server.verify_eval_grid(
+                request,
+                EvalGridVerificationRequest(
+                    response=_text_response(f"<answer>\n{answer}\n</answer>"), grid_id=grid_id
+                ),
+            )
+        result = await server.finalize(request, _finalize_request(protocol="hidden_test"))
+        assert not result.train_gate_pass
+        assert result.train_exact_fraction == 0.5  # final rule: train_1 only
+        assert result.train_any_solved_fraction == 1.0  # loop progress diagnostic
+
+    async def test_final_rule_solving_all_demos_passes_the_gate(self) -> None:
+        server, request = await self._seeded("gate-pass")
+        for grid_id, answer in (
+            ("train_0", "9 9"),  # rule 1: miss
+            ("train_0", "0 1"),  # final rule: exact
+            ("train_1", "0 4"),  # final rule: exact
+            ("test_0", "0 2"),
+        ):
+            await server.verify_eval_grid(
+                request,
+                EvalGridVerificationRequest(
+                    response=_text_response(f"<answer>\n{answer}\n</answer>"), grid_id=grid_id
+                ),
+            )
+        result = await server.finalize(request, _finalize_request(protocol="hidden_test"))
+        assert result.train_gate_pass
+        assert result.train_exact_fraction == 1.0
+
+
+class TestFeedbackSuppression:
+    async def test_no_feedback_verifications_never_carry_target_content(self) -> None:
+        server = _server()
+        request = _request("suppress")
+        await server.seed_session(
+            request,
+            ARCAGIRunRequest(
+                responses_create_params={"input": []},
+                train=[{"input": [[1, 0]], "output": [[0, 1]]}],
+                test=[{"input": [[2, 0]], "output": [[7, 8, 9]]}],
+                task_id="suppress-task",
+            ),
+        )
+        result = await server.verify_eval_grid(
+            request,
+            EvalGridVerificationRequest(
+                response=_text_response("<answer>\n2 2\n</answer>"),
+                grid_id="test_0",
+                include_revision_feedback=False,
+            ),
+        )
+        assert not result.exact
+        assert result.revision_feedback is None
+        serialized = result.model_dump_json()
+        # Neither the evidence prompt nor the diff text leaks the target.
+        assert "7 8 9" not in serialized
+        assert "Expected output" not in serialized
+        assert "mismatch" in result.feedback
+
+
+class TestCandidateSelection:
+    async def _seeded(self, session_id: str) -> tuple[ARCAGIResourcesServer, Request]:
+        server = _server()
+        request = _request(session_id)
+        await server.seed_session(
+            request,
+            ARCAGIRunRequest(
+                responses_create_params={"input": []},
+                train=[
+                    {"input": [[1, 0]], "output": [[0, 1]]},
+                    {"input": [[4, 0]], "output": [[0, 4]]},
+                ],
+                test=[{"input": [[2, 0]], "output": [[0, 2]]}],
+                task_id="cand-task",
+            ),
+        )
+        return server, request
+
+    async def _record(self, server, request, candidate_id: str, grid_id: str, answer: str) -> None:
+        await server.verify_eval_grid(
+            request,
+            EvalGridVerificationRequest(
+                response=_text_response(f"<answer>\n{answer}\n</answer>"),
+                grid_id=grid_id,
+                candidate_id=candidate_id,
+                include_revision_feedback=False,
+            ),
+        )
+
+    async def test_candidate_attempts_stay_out_of_episode_results(self) -> None:
+        server, request = await self._seeded("cand-namespace")
+        await self._record(server, request, "cand_000", "train_0", "0 1")
+        session = server._sessions["cand-namespace"]
+        assert session.eval_results == {}
+        assert session.candidate_results["cand_000"]["train_0"][0]["grid_match"] == 1.0
+
+    async def test_selection_ranks_by_exact_count_then_cell_then_order(self) -> None:
+        from resources_servers.arc_agi_2.app import CandidateSelectionRequest
+
+        server, request = await self._seeded("cand-rank")
+        # cand_000: one exact, one miss. cand_001: both exact (must win).
+        # cand_002: both exact too, but later in emission order.
+        await self._record(server, request, "cand_000", "train_0", "0 1")
+        await self._record(server, request, "cand_000", "train_1", "9 9")
+        for candidate_id in ("cand_001", "cand_002"):
+            await self._record(server, request, candidate_id, "train_0", "0 1")
+            await self._record(server, request, candidate_id, "train_1", "0 4")
+        selection = await server.select_candidate(request, CandidateSelectionRequest())
+        assert selection.selected_candidate_id == "cand_001"
+        assert selection.scores["cand_001"]["demo_exact_count"] == 2.0
+        assert selection.scores["cand_000"]["demo_exact_count"] == 1.0
+        # Scores are task-level aggregates only: no grids anywhere.
+        serialized = selection.model_dump_json()
+        assert "0 1" not in serialized and "[[" not in serialized
+
+    async def test_selection_tie_breaks_on_cell_match_before_order(self) -> None:
+        from resources_servers.arc_agi_2.app import CandidateSelectionRequest
+
+        server, request = await self._seeded("cand-cell")
+        # Equal exact counts (zero); cand_001 is closer on cells and must win
+        # despite its later emission order.
+        await self._record(server, request, "cand_000", "train_0", "9 9")
+        await self._record(server, request, "cand_000", "train_1", "9 9")
+        await self._record(server, request, "cand_001", "train_0", "0 9")
+        await self._record(server, request, "cand_001", "train_1", "0 9")
+        selection = await server.select_candidate(request, CandidateSelectionRequest())
+        assert selection.selected_candidate_id == "cand_001"
+
+    async def test_selection_without_recorded_candidates_is_an_error(self) -> None:
+        from fastapi import HTTPException
+
+        from resources_servers.arc_agi_2.app import CandidateSelectionRequest
+
+        server, request = await self._seeded("cand-empty")
+        with pytest.raises(HTTPException):
+            await server.select_candidate(request, CandidateSelectionRequest())
+
+    async def test_finalize_verifies_the_selection_and_scores_one_test_touch(self) -> None:
+        server, request = await self._seeded("cand-final")
+        await self._record(server, request, "cand_000", "train_0", "9 9")
+        await self._record(server, request, "cand_000", "train_1", "9 9")
+        await self._record(server, request, "cand_001", "train_0", "0 1")
+        await self._record(server, request, "cand_001", "train_1", "0 4")
+        # Only the selected rule touches the test, recorded in the main pool.
+        await server.verify_eval_grid(
+            request,
+            EvalGridVerificationRequest(
+                response=_text_response("<answer>\n0 2\n</answer>"),
+                grid_id="test_0",
+                include_revision_feedback=False,
+            ),
+        )
+        finalize = _finalize_request(protocol="candidate_select")
+        finalize = finalize.model_copy(update={"selected_candidate_id": "cand_001"})
+        result = await server.finalize(request, finalize)
+        assert result.selection_verified
+        assert result.selected_candidate_id == "cand_001"
+        assert result.num_candidates == 2
+        assert result.train_gate_pass  # the SELECTED candidate solved every demo
+        assert result.test_exact and result.grid_match == 1.0
+
+    async def test_finalize_flags_a_selection_that_disagrees_with_demo_ranking(self) -> None:
+        server, request = await self._seeded("cand-mismatch")
+        await self._record(server, request, "cand_000", "train_0", "0 1")
+        await self._record(server, request, "cand_000", "train_1", "0 4")
+        await self._record(server, request, "cand_001", "train_0", "9 9")
+        await self._record(server, request, "cand_001", "train_1", "9 9")
+        finalize = _finalize_request(protocol="candidate_select")
+        finalize = finalize.model_copy(update={"selected_candidate_id": "cand_001"})
+        result = await server.finalize(request, finalize)
+        assert not result.selection_verified
+        assert not result.train_gate_pass  # gate follows the COMMITTED candidate
 
 
 class TestSingleTurnVerify:

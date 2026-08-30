@@ -182,11 +182,21 @@ class ARCAGIVerifyRequest(BaseVerifyRequest):
 
 
 class EvalGridVerificationRequest(BaseModel):
-    """One fresh single-grid executor response for one evaluation grid."""
+    """One fresh single-grid executor response for one evaluation grid.
+
+    ``candidate_id`` routes the attempt into a per-candidate namespace used by
+    the candidate-selection protocol instead of the episode's main results.
+    ``include_revision_feedback`` exists so callers that will never revise
+    (hidden-test final answers, candidate demo scoring) do not receive -- and
+    therefore cannot record into saved traces -- the target-bearing evidence
+    prompt.
+    """
 
     response: NeMoGymResponse
     grid_id: str
     record_result: bool = True
+    candidate_id: str | None = None
+    include_revision_feedback: bool = True
 
 
 class EvalGridVerificationResponse(BaseModel):
@@ -208,6 +218,26 @@ class EvalGridVerificationResponse(BaseModel):
     terms: dict[str, float] = Field(default_factory=dict)
 
 
+class CandidateSelectionRequest(BaseModel):
+    """Ask the server to rank the recorded candidate namespaces on demo grids."""
+
+    # Nothing beyond the session cookie is needed; the request body exists so
+    # the endpoint can grow controls without changing its shape.
+    model_config = ConfigDict(extra="forbid")
+
+
+class CandidateSelectionResponse(BaseModel):
+    """Server-owned candidate ranking computed from demo attempts only.
+
+    ``scores`` carries per-candidate aggregates (exact count, mean cell match,
+    mean format validity) -- task-level scores only, never grids -- so the
+    selection report can be persisted without target leakage.
+    """
+
+    selected_candidate_id: str
+    scores: dict[str, dict[str, float]]
+
+
 class ARCAGIFinalizeRequest(BaseVerifyRequest):
     """Final-proposer-only response plus audit metadata."""
 
@@ -218,6 +248,11 @@ class ARCAGIFinalizeRequest(BaseVerifyRequest):
     # final turn receives negative gradient instead of being masked.
     proposer_format_failure: bool = False
     protocol: str = "hidden_test"
+    # candidate_select episodes: the candidate whose rule answered the test.
+    # Finalize re-derives the ranking from the recorded demo attempts and
+    # flags a mismatch, so a selector that peeked past the demo scores is
+    # detectable.
+    selected_candidate_id: str | None = None
     trace: dict[str, Any]
 
 
@@ -243,8 +278,17 @@ class ARCAGIVerifyResponse(BaseVerifyResponse):
     train_gate_pass: bool = False
     test_exact: bool = False
     test_cell_accuracy: float = 0.0
+    # Fraction of demo grids whose LAST attempt (the final rule, after the
+    # agent's all-demo sweep) was exact; the gate above requires 1.0.
     train_exact_fraction: float = 0.0
+    # Fraction of demo grids that ANY attempt solved -- the loop-progress
+    # diagnostic; it says nothing about the rule that answered the test.
+    train_any_solved_fraction: float = 0.0
     train_cell_accuracy: float = 0.0
+    # Candidate-selection episodes only.
+    selected_candidate_id: str | None = None
+    selection_verified: bool = False
+    num_candidates: int = 0
     # Evaluation-sequence episode metrics (eval_sequence protocol only).
     eval_exact_fraction: float = 0.0
     eval_cell_match: float = 0.0
@@ -275,6 +319,9 @@ class ARCSessionState:
     # record held-out test grids; hidden_test episodes record demo (train)
     # grids during refinement and test grids for the final answers.
     eval_results: dict[str, list[dict[str, float]]]
+    # candidate_select episodes: demo attempts per candidate id, kept out of
+    # eval_results so the losing candidates never touch the episode score.
+    candidate_results: dict[str, dict[str, list[dict[str, float]]]]
 
 
 def _extract_assistant_text(response: NeMoGymResponse) -> str:
@@ -308,6 +355,51 @@ def _parse_grid(text: str) -> Grid | None:
     return None
 
 
+def rank_candidates(
+    candidate_results: dict[str, dict[str, list[dict[str, float]]]],
+    demo_grid_ids: list[str],
+) -> tuple[str, dict[str, dict[str, float]]]:
+    """Rank candidate rules on their recorded demo attempts only.
+
+    Aggregation order (the documented tie-break): demo exact count first,
+    then mean cell match, then mean format validity, then candidate id
+    ascending (ids are zero-padded, so lexicographic order is emission
+    order). Each demo grid is scored on the candidate's LAST attempt -- the
+    format retry replaces the failed first try -- and an unattempted grid is
+    a miss with zero cell/format credit, so skipping demos can never help.
+    Test grids play no part: this function only ever sees demo ids.
+    """
+    if not candidate_results:
+        raise ValueError("no candidate attempts recorded")
+    scores: dict[str, dict[str, float]] = {}
+    denominator = max(1, len(demo_grid_ids))
+    for candidate_id, per_grid in candidate_results.items():
+        exact = cell = format_valid = 0.0
+        for grid_id in demo_grid_ids:
+            attempts = per_grid.get(grid_id, [])
+            if attempts:
+                final = attempts[-1]
+                exact += final["grid_match"]
+                cell += final["cell_match"]
+                format_valid += final["format_valid"]
+        scores[candidate_id] = {
+            "demo_exact_count": exact,
+            "demo_mean_cell_match": cell / denominator,
+            "demo_mean_format_valid": format_valid / denominator,
+            "demo_grids": float(len(demo_grid_ids)),
+        }
+    selected = min(
+        scores,
+        key=lambda candidate_id: (
+            -scores[candidate_id]["demo_exact_count"],
+            -scores[candidate_id]["demo_mean_cell_match"],
+            -scores[candidate_id]["demo_mean_format_valid"],
+            candidate_id,
+        ),
+    )
+    return selected, scores
+
+
 class ARCAGIResourcesServer(SimpleResourcesServer):
     """Own ARC targets and expose strict train/test verification endpoints."""
 
@@ -320,6 +412,7 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
         app.post("/verify_eval_grid")(self.verify_eval_grid)
+        app.post("/select_candidate")(self.select_candidate)
         app.post("/finalize")(self.finalize)
         return app
 
@@ -333,6 +426,7 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             test_inputs={f"test_{index}": pair.input for index, pair in enumerate(tests)},
             test_targets={f"test_{index}": pair.output for index, pair in enumerate(tests)},
             eval_results={},
+            candidate_results={},
         )
         return BaseSeedSessionResponse()
 
@@ -368,7 +462,12 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
         predicted = extract_answer_grid(text)
         terms = score_grid(predicted, target, echo_input, self.config.reward_weights())
         if body.record_result:
-            session.eval_results.setdefault(body.grid_id, []).append(dict(terms))
+            if body.candidate_id is not None:
+                session.candidate_results.setdefault(body.candidate_id, {}).setdefault(body.grid_id, []).append(
+                    dict(terms)
+                )
+            else:
+                session.eval_results.setdefault(body.grid_id, []).append(dict(terms))
         if predicted is None:
             return EvalGridVerificationResponse(
                 grid_id=body.grid_id,
@@ -379,28 +478,54 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             )
         comparison = compare_grid(grid_id=body.grid_id, predicted=predicted, correct=target)
         revision_feedback = None
+        feedback = comparison.feedback
         if not comparison.exact:
-            revision_feedback = build_eval_feedback_prompt(
-                grid_id=body.grid_id,
-                input_grid=echo_input,
-                predicted=predicted,
-                expected=target,
-                diff_feedback=comparison.feedback,
-            )
+            if body.include_revision_feedback:
+                revision_feedback = build_eval_feedback_prompt(
+                    grid_id=body.grid_id,
+                    input_grid=echo_input,
+                    predicted=predicted,
+                    expected=target,
+                    diff_feedback=comparison.feedback,
+                )
+            else:
+                # No-feedback verifications (hidden-test final answers,
+                # candidate demo scoring) get a terse verdict: the diff text
+                # encodes the target cell-by-cell, and these verifications are
+                # recorded into saved traces.
+                feedback = f"Example {body.grid_id}: mismatch."
         return EvalGridVerificationResponse(
             grid_id=body.grid_id,
             format_valid=True,
             exact=comparison.exact,
             predicted=predicted,
-            feedback=comparison.feedback,
+            feedback=feedback,
             revision_feedback=revision_feedback,
             terms=terms,
         )
+
+    async def select_candidate(self, request: Request, body: CandidateSelectionRequest) -> CandidateSelectionResponse:
+        """Rank recorded candidate namespaces on demo grids and pick a winner.
+
+        Selection lives server-side so it structurally cannot read test
+        information: at call time the session holds only demo attempts in the
+        candidate namespaces, and the ranking never touches the test pools.
+        """
+        session = self._session(request)
+        if not session.candidate_results:
+            raise HTTPException(
+                status_code=400,
+                detail="no candidate demo attempts recorded; verify demo grids with candidate_id first",
+            )
+        selected, scores = rank_candidates(session.candidate_results, list(session.train_targets))
+        return CandidateSelectionResponse(selected_candidate_id=selected, scores=scores)
 
     async def finalize(self, request: Request, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:
         session = self._session(request)
         if body.protocol == "eval_sequence":
             return self._finalize_eval_sequence(session, body)
+        if body.protocol == "candidate_select":
+            return self._finalize_candidate_select(session, body)
         return self._finalize_hidden_test(session, body)
 
     def _finalize_hidden_test(self, session: ARCSessionState, body: ARCAGIFinalizeRequest) -> ARCAGIVerifyResponse:
@@ -409,9 +534,12 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
         Each test grid is scored on its LAST recorded attempt -- the answer
         the episode actually committed to (a format retry replaces the failed
         first attempt). Unanswered test grids sit at the reward floor. The
-        demo-refinement loop contributes diagnostics only: ``train_gate_pass``
-        (every demo grid verified exactly at some point) and
-        ``train_exact_fraction``.
+        demo diagnostics describe the FINAL rule: the agent sweeps every demo
+        grid with the current rule before answering the test, so each demo's
+        last attempt is the rule the test actually received, and
+        ``train_gate_pass`` requires that rule to solve every demo.
+        ``train_any_solved_fraction`` keeps the old any-attempt loop-progress
+        reading.
         """
         floor = reward_floor(self.config.reward_weights())
         per_grid_rewards: list[float] = []
@@ -432,10 +560,12 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
                 per_grid_cell.append(0.0)
                 per_grid_format.append(0.0)
         count = len(per_grid_rewards)
-        demo_solved = [
-            float(any(attempt["grid_match"] for attempt in session.eval_results.get(grid_id, [])))
-            for grid_id in session.train_targets
-        ]
+        demo_final_exact = []
+        demo_any_solved = []
+        for grid_id in session.train_targets:
+            attempts = session.eval_results.get(grid_id, [])
+            demo_final_exact.append(float(bool(attempts) and attempts[-1]["grid_match"] > 0))
+            demo_any_solved.append(float(any(attempt["grid_match"] for attempt in attempts)))
         grid_match = sum(per_grid_exact) / count if count else 0.0
         reward = sum(per_grid_rewards) / count if count else floor
         if body.proposer_format_failure:
@@ -451,12 +581,88 @@ class ARCAGIResourcesServer(SimpleResourcesServer):
             loss_masked=body.loss_masked,
             proposer_format_failure=body.proposer_format_failure,
             instance_config={"mask_sample": body.loss_masked},
-            train_gate_pass=bool(demo_solved) and all(demo_solved),
+            train_gate_pass=bool(demo_final_exact) and all(demo_final_exact),
             test_exact=count > 0 and grid_match == 1.0,
             grid_match=grid_match,
             cell_match=sum(per_grid_cell) / count if count else 0.0,
             format_valid=sum(per_grid_format) / count if count else 0.0,
-            train_exact_fraction=(sum(demo_solved) / len(demo_solved)) if demo_solved else 0.0,
+            train_exact_fraction=(sum(demo_final_exact) / len(demo_final_exact) if demo_final_exact else 0.0),
+            train_any_solved_fraction=(sum(demo_any_solved) / len(demo_any_solved) if demo_any_solved else 0.0),
+            rounds_used=len(body.trace.get("rounds", [])),
+            trace=body.trace,
+        )
+
+    def _finalize_candidate_select(
+        self, session: ARCSessionState, body: ARCAGIFinalizeRequest
+    ) -> ARCAGIVerifyResponse:
+        """Score a candidate-selection episode: demos chose, the test decided.
+
+        Test grids are scored exactly like hidden_test episodes: the LAST
+        recorded attempt in the main results, which the agent produced only
+        with the selected rule -- the test is touched once per grid. Demo
+        diagnostics come from the SELECTED candidate's namespace, and the
+        server re-derives the ranking from the recorded demo attempts so a
+        selector that disagreed with the demo-only ranking is flagged.
+        """
+        floor = reward_floor(self.config.reward_weights())
+        per_grid_rewards: list[float] = []
+        per_grid_exact: list[float] = []
+        per_grid_cell: list[float] = []
+        per_grid_format: list[float] = []
+        for grid_id in session.test_targets:
+            attempts = session.eval_results.get(grid_id, [])
+            if attempts:
+                final = attempts[-1]
+                per_grid_rewards.append(final["reward"])
+                per_grid_exact.append(final["grid_match"])
+                per_grid_cell.append(final["cell_match"])
+                per_grid_format.append(final["format_valid"])
+            else:
+                per_grid_rewards.append(floor)
+                per_grid_exact.append(0.0)
+                per_grid_cell.append(0.0)
+                per_grid_format.append(0.0)
+        count = len(per_grid_rewards)
+        grid_match = sum(per_grid_exact) / count if count else 0.0
+        reward = sum(per_grid_rewards) / count if count else floor
+        if body.proposer_format_failure:
+            reward = floor
+
+        selection_verified = False
+        demo_final_exact: list[float] = []
+        if session.candidate_results and body.selected_candidate_id is not None:
+            expected_selection, _ = rank_candidates(session.candidate_results, list(session.train_targets))
+            selection_verified = expected_selection == body.selected_candidate_id
+            selected_demo_attempts = session.candidate_results.get(body.selected_candidate_id, {})
+            for grid_id in session.train_targets:
+                attempts = selected_demo_attempts.get(grid_id, [])
+                demo_final_exact.append(float(bool(attempts) and attempts[-1]["grid_match"] > 0))
+        return ARCAGIVerifyResponse(
+            **body.model_dump(
+                exclude={
+                    "termination_reason",
+                    "loss_masked",
+                    "proposer_format_failure",
+                    "protocol",
+                    "selected_candidate_id",
+                    "trace",
+                }
+            ),
+            reward=reward,
+            task_id=session.task_id,
+            termination_reason=body.termination_reason,
+            loss_masked=body.loss_masked,
+            proposer_format_failure=body.proposer_format_failure,
+            instance_config={"mask_sample": body.loss_masked},
+            train_gate_pass=bool(demo_final_exact) and all(demo_final_exact),
+            test_exact=count > 0 and grid_match == 1.0,
+            grid_match=grid_match,
+            cell_match=sum(per_grid_cell) / count if count else 0.0,
+            format_valid=sum(per_grid_format) / count if count else 0.0,
+            train_exact_fraction=(sum(demo_final_exact) / len(demo_final_exact) if demo_final_exact else 0.0),
+            selected_candidate_id=body.selected_candidate_id,
+            selection_verified=selection_verified,
+            num_candidates=len(session.candidate_results),
             rounds_used=len(body.trace.get("rounds", [])),
             trace=body.trace,
         )

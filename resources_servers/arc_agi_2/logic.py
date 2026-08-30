@@ -66,6 +66,7 @@ class TerminationReason(str, Enum):
 
     TRAIN_VERIFIED = "train_verified"
     ALL_SOLVED = "all_solved"
+    CANDIDATE_SELECTED = "candidate_selected"
     CONTEXT_EXHAUSTED = "context_exhausted"
     EXECUTOR_FORMAT_FAILURE = "executor_format_failure"
     EXECUTOR_CONTEXT_EXHAUSTED = "executor_context_exhausted"

@@ -53,7 +53,8 @@ from resources_servers.arc_agi_2.logic import (
 
 
 PROPOSER_INSTRUCTIONS = (
-    "Act only as an ARC transformation-rule proposer. Return the requested "
+    "Act only as an ARC transformation-rule proposer. Be precise and concise; "
+    "stop reasoning once one rule explains every example. Return the requested "
     "transformation-description artifact; do not execute the test grid."
 )
 EXECUTOR_INSTRUCTIONS = (

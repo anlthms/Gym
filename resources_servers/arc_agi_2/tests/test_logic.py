@@ -1,6 +1,7 @@
 import pytest
 
 from resources_servers.arc_agi_2.logic import (
+    COLOR_MAPPING,
     ContextBudget,
     EpisodePhase,
     EpisodeState,
@@ -144,6 +145,8 @@ def test_single_executor_prompt_matches_the_training_contract() -> None:
     assert "<input>\n1 0\n</input>" in prompt
     assert prompt.endswith("Preserve the exact output shape implied by the operation.\n")
     assert "JSON" in prompt  # the no-JSON instruction is part of the contract
+    assert "6=magenta" in prompt and "8=azure" in prompt and "9=maroon" in prompt
+    assert "fuchsia" not in prompt and "teal" not in prompt and "brown" not in prompt
 
 
 def test_nvarc_proposer_prompt_shows_demos_but_never_eval_grids() -> None:
@@ -151,6 +154,8 @@ def test_nvarc_proposer_prompt_shows_demos_but_never_eval_grids() -> None:
     assert "demo_0" in prompt
     assert "1 0" in prompt and "0 1" in prompt
     assert "rules_summary" in prompt and "puzzle_concepts" in prompt
+    assert COLOR_MAPPING in prompt
+    assert "Reason carefully but concisely" in prompt
     assert "Test input" not in prompt
 
 

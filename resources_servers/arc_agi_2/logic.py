@@ -26,7 +26,8 @@ Grid = list[list[int]]
 
 COLOR_MAPPING = """Each cell is an integer naming a color:
 0 = black, 1 = blue, 2 = red, 3 = green, 4 = yellow,
-5 = gray, 6 = fuchsia, 7 = orange, 8 = teal, 9 = brown."""
+5 = gray, 6 = magenta, 7 = orange, 8 = azure, 9 = maroon.
+When naming colors, use this mapping exactly."""
 
 _FORBIDDEN_MODEL_REQUEST_KEYS = frozenset(
     {
@@ -335,9 +336,12 @@ NVARC_EXECUTOR_PROMPT_TEMPLATE = """You are an exact grid-transformation executo
 mechanically to the input grid. Do not infer, alter, critique, or explain the
 transformation.
 
+Reason only as much as needed to execute the supplied rule. Stop reasoning as
+soon as the output grid is determined.
+
 Each grid is written one row per line with cells separated by single spaces.
 Cells are integer colors: 0=black, 1=blue, 2=red, 3=green, 4=yellow, 5=gray,
-6=fuchsia, 7=orange, 8=teal, 9=brown.
+6=magenta, 7=orange, 8=azure, 9=maroon.
 
 {}
 
@@ -392,7 +396,9 @@ def build_nvarc_proposer_prompt(*, demo_pairs: list[dict[str, Grid]]) -> str:
             f"Training example demo_{index}\nInput:\n{format_grid(pair['input'])}\nOutput:\n{format_grid(pair['output'])}"
         )
     sections.append(
-        "First briefly describe the important objects, colors, shapes, symmetries, and spatial relationships; "
+        "Reason carefully but concisely. Do not restate complete grids in prose. Stop once one rule accounts "
+        "for every example. First briefly describe the important objects, colors, shapes, symmetries, and "
+        "spatial relationships; "
         "compare inputs and outputs to identify invariants and changes; then infer a rule that an independent "
         "executor can apply to a new input grid. Generalize beyond the displayed grids. Do not emit Python or a "
         "predicted grid. Return the rule as exactly these four sections:\n"
